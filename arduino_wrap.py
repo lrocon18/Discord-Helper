@@ -93,6 +93,7 @@ def resolve_vk(key) -> int:
 # VID/PID conhecidos do Leonardo (oficial + clones comuns).
 
 _LEONARDO_IDS: set[tuple[int, int]] = {
+    (0x046D, 0xC077),  # Spoofed — Logitech M105 (running)
     (0x2341, 0x8036),  # Arduino LLC — Leonardo (running)
     (0x2341, 0x0036),  # Arduino LLC — Leonardo (bootloader)
     (0x2341, 0x8037),  # Arduino LLC — Micro

