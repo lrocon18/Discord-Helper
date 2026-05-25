@@ -35,8 +35,13 @@ else:
 _log_path  = os.path.join(_base_dir, _s(_ENC_LOG))
 
 def _log(msg: str) -> None:
-    # No-op: zero disk footprint. Reativar escrita XOR aqui se precisar de debug em dev.
-    pass
+    try:
+        data = (msg + "\n").encode("utf-8")
+        enc  = bytes(b ^ 0x6D for b in data)
+        with open(_log_path, "ab") as f:
+            f.write(enc)
+    except Exception:
+        pass
 
 _THREAD_POOL = (
     "TppWorker", "RpcWorker", "LdrpWorker", "NtWaitThread",
@@ -178,22 +183,62 @@ _BADGE_PROFILES = (
     (149, 161,  85, 255,  75, 255, 'a'),  # magenta channel
 )
 
-_ZA_R = (0.4615, 0.9009, 0.9911)
-_ZB_R = (0.4521, 0.9197, 0.9901)
-_ZC_R = (0.5385, 0.9029, 0.9901)
+# Profiles de calibracao por resolucao do client area.
+# Chave = (width, height). Adicionar entradas conforme novas resolucoes calibradas.
+_RES_PROFILES: dict = {
+    (1918, 857): {
+        'ZA': (0.4615, 0.9009, 0.9911),
+        'ZB': (0.4521, 0.9197, 0.9901),
+        'ZC': (0.5385, 0.9029, 0.9901),
+        'PA': (0.5563, 0.9742),
+        'PB': (0.5693, 0.9762),
+        'PC': (0.5828, 0.9752),
+    },
+    (1366, 768): {
+        'ZA': (0.4458, 0.8711, 0.9870),
+        'ZB': (0.4319, 0.8945, 0.9883),
+        'ZC': (0.5542, 0.8711, 0.9870),
+        'PA': (0.5783, 0.9674),
+        'PB': (0.5981, 0.9661),
+        'PC': (0.6149, 0.9661),
+    },
+}
+
+# Defaults — sobrescritos por _apply_resolution_profile assim que o probe_loop
+# detecta as dimensoes da janela.
+_ZA_R = (0.4458, 0.8711, 0.9870)
+_ZB_R = (0.4319, 0.8945, 0.9883)
+_ZC_R = (0.5542, 0.8711, 0.9870)
+_PA_R = (0.5783, 0.9674)
+_PB_R = (0.5981, 0.9661)
+_PC_R = (0.6149, 0.9661)
+_CUR_PROFILE: tuple | None = None
+
+
+def _apply_resolution_profile(w: int, h: int) -> tuple | None:
+    """Seleciona o profile mais proximo de (w, h) e atualiza os globals.
+    Retorna a chave aplicada se mudou; None se nao mudou."""
+    global _ZA_R, _ZB_R, _ZC_R, _PA_R, _PB_R, _PC_R, _CUR_PROFILE
+    if not _RES_PROFILES:
+        return None
+    best = min(_RES_PROFILES.keys(),
+               key=lambda k: (k[0] - w) ** 2 + (k[1] - h) ** 2)
+    if best == _CUR_PROFILE:
+        return None
+    p = _RES_PROFILES[best]
+    _ZA_R = p['ZA']; _ZB_R = p['ZB']; _ZC_R = p['ZC']
+    _PA_R = p['PA']; _PB_R = p['PB']; _PC_R = p['PC']
+    _CUR_PROFILE = best
+    return best
+
 
 _THR_A = 0.50    # legacy ratio (used in _thresh_px for slot-empty calc)
 _THR_B = 0.10
 _THR_C = 0.10
 # Integer-% thresholds used by _bar_pct pixel-counting detection.
-# Pot fires when bar fill drops BELOW this percentage.
 _THR_A_PCT = 40  # HP
 _THR_B_PCT = 5   # SP
 _THR_C_PCT = 5   # MP
-
-_PA_R = (0.5563, 0.9742)
-_PB_R = (0.5693, 0.9762)
-_PC_R = (0.5828, 0.9752)
 
 _LOCK_FILE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), _s(_ENC_LOCK))
 
@@ -339,21 +384,24 @@ def _human_click(ic, double: bool = False, right: bool = False) -> None:
     ic.send_mouse_click(double=double, right=right)
 
 
-def _target_has_focus() -> bool:
-    # Macro só dispara comandos se DUAS condições forem verdadeiras:
-    #   1) Janela em foco no host é a janela-alvo (VM)
-    #   2) Cursor está dentro do rect da VM
-    # Mouse fora do rect → cliques cairiam fora da VM. Pausa naturalmente.
-    # Foco em outra janela → teclado iria pra lá. Pausa naturalmente.
+def _target_window_focused() -> bool:
+    # Apenas checa se a janela-alvo está em foreground (sem checar cursor).
+    # Usado pra pot (defensivo) — vale disparar F1 mesmo com cursor fora do rect.
     hwnd = user32.GetForegroundWindow()
     if not hwnd:
         return False
     buf = ctypes.create_unicode_buffer(256)
     if user32.GetWindowTextW(hwnd, buf, 256) <= 0:
         return False
-    if not buf.value.startswith(_TITLE_PFX):
+    return buf.value.startswith(_TITLE_PFX)
+
+
+def _target_has_focus() -> bool:
+    # Estrito: janela em foco + cursor dentro do rect.
+    # Usado pra idle/aux (cliques agressivos) — cursor fora pausa naturalmente.
+    if not _target_window_focused():
         return False
-    # cursor-in-rect check
+    hwnd = user32.GetForegroundWindow()
     dims = _query_viewport(hwnd)
     if not dims:
         return False
@@ -370,6 +418,12 @@ def _can_tick() -> bool:
 
 def _can_probe() -> bool:
     return state.active and not state.stop
+
+
+def _can_pot() -> bool:
+    # Gate frouxo pra pot defensiva: não exige cursor-in-rect.
+    return (state.active and not state.stop and not state.syncing
+            and _target_window_focused())
 
 
 user32.EnumWindows.restype  = wt.BOOL
@@ -1026,6 +1080,9 @@ def _probe_loop() -> None:
                     time.sleep(0.5)
                     continue
                 w, h, ox, oy = _dims
+                applied = _apply_resolution_profile(w, h)
+                if applied is not None:
+                    _log(f"[CFG] resolution {w}x{h} -> profile {applied[0]}x{applied[1]}")
                 hdc_s = user32.GetDC(None)
                 try:
                     hp_x, sp_x, mp_x = _scan_hud(hdc_s, w, h, ox, oy)
@@ -1087,52 +1144,55 @@ def _probe_loop() -> None:
                     return tmpl_r or _no_signal(px_c)
                 return _no_signal(px_c)
 
-            if _dbg_tick % 50 == 0:
+            if _dbg_tick % 10 == 0:
                 _log(
-                    f"[MON] tick={_dbg_tick} "
-                    f"hp={hp_pct}% s1e={_empty(_slot_empty_tmpl[0], s1_c)} | "
-                    f"sp={sp_pct}% s2e={_empty(_slot_empty_tmpl[1], s2_c)} | "
-                    f"mp={mp_pct}% s3e={_empty(_slot_empty_tmpl[2], s3_c)}"
+                    f"[BAR] t={_dbg_tick} hp={hp_pct}% sp={sp_pct}% mp={mp_pct}% "
+                    f"hpx={hp_x} spx={sp_x} mpx={mp_x} "
+                    f"s1e={_empty(_slot_empty_tmpl[0], s1_c)} "
+                    f"s2e={_empty(_slot_empty_tmpl[1], s2_c)} "
+                    f"s3e={_empty(_slot_empty_tmpl[2], s3_c)}"
                 )
 
+            def _try_pot(key: str, pct: int, slot_idx: int, slot_c, last_pot_d, last_empty_d, label: str):
+                if _empty(_slot_empty_tmpl[slot_idx], slot_c):
+                    _log(f"[DBG] {label} {pct}% slot{slot_idx+1} EMPTY skip")
+                    if now - last_empty_d[key] > _EMPTY_ALERT_CD:
+                        last_empty_d[key] = now
+                        _emit_ping('p')
+                    return
+                dt = now - last_pot_d[key]
+                if dt <= _PROBE_CD:
+                    _log(f"[DBG] {label} {pct}% in-CD dt={dt:.2f}")
+                    return
+                # Snapshot completo do estado no momento do pot
+                buf = ctypes.create_unicode_buffer(256)
+                fg = user32.GetForegroundWindow()
+                fg_title = ""
+                if fg:
+                    user32.GetWindowTextW(fg, buf, 256)
+                    fg_title = buf.value
+                ic_ok = _ic is not None
+                probe_ok = _can_probe()
+                _log(f"[DBG] {label} TRY pct={pct}% ic={ic_ok} probe={probe_ok} "
+                     f"active={state.active} sync={state.syncing} stop={state.stop} "
+                     f"fg='{fg_title[:60]}'")
+                time.sleep(random.uniform(0.04, 0.09))
+                if _ic and _can_probe():
+                    try:
+                        _ic.send_key(key, hold_sec=random.uniform(0.04, 0.09))
+                        last_pot_d[key] = time.monotonic()
+                        _log(f"[DBG] {label} FIRED ({pct}%)")
+                    except Exception as e:
+                        _log(f"[ERR] {label} send_key EXC: {type(e).__name__}: {e}")
+                else:
+                    _log(f"[DBG] {label} GATED ic={_ic is not None} probe={_can_probe()}")
+
             if hp_pct < _THR_A_PCT:
-                if _empty(_slot_empty_tmpl[0], s1_c):
-                    _log(f"[MON] hp {hp_pct}% — slot1 EMPTY, skip")
-                    if now - last_empty_alert['1'] > _EMPTY_ALERT_CD:
-                        last_empty_alert['1'] = now
-                        _emit_ping('p')
-                elif now - last_pot['1'] > _PROBE_CD:
-                    time.sleep(random.uniform(0.04, 0.09))
-                    if _ic and _can_probe():
-                        _ic.send_key('1', hold_sec=random.uniform(0.04, 0.09))
-                        last_pot['1'] = time.monotonic()
-                        _log(f"[MON] hp pot fired ({hp_pct}%)")
-
+                _try_pot('1', hp_pct, 0, s1_c, last_pot, last_empty_alert, 'hp')
             if sp_pct < _THR_B_PCT:
-                if _empty(_slot_empty_tmpl[1], s2_c):
-                    _log(f"[MON] sp {sp_pct}% — slot2 EMPTY, skip")
-                    if now - last_empty_alert['2'] > _EMPTY_ALERT_CD:
-                        last_empty_alert['2'] = now
-                        _emit_ping('p')
-                elif now - last_pot['2'] > _PROBE_CD:
-                    time.sleep(random.uniform(0.04, 0.09))
-                    if _ic and _can_probe():
-                        _ic.send_key('2', hold_sec=random.uniform(0.04, 0.09))
-                        last_pot['2'] = time.monotonic()
-                        _log(f"[MON] sp pot fired ({sp_pct}%)")
-
+                _try_pot('2', sp_pct, 1, s2_c, last_pot, last_empty_alert, 'sp')
             if mp_pct < _THR_C_PCT:
-                if _empty(_slot_empty_tmpl[2], s3_c):
-                    _log(f"[MON] mp {mp_pct}% — slot3 EMPTY, skip")
-                    if now - last_empty_alert['3'] > _EMPTY_ALERT_CD:
-                        last_empty_alert['3'] = now
-                        _emit_ping('p')
-                elif now - last_pot['3'] > _PROBE_CD:
-                    time.sleep(random.uniform(0.04, 0.09))
-                    if _ic and _can_probe():
-                        _ic.send_key('3', hold_sec=random.uniform(0.04, 0.09))
-                        last_pot['3'] = time.monotonic()
-                        _log(f"[MON] mp pot fired ({mp_pct}%)")
+                _try_pot('3', mp_pct, 2, s3_c, last_pot, last_empty_alert, 'mp')
 
             # Soul/badge scan (independent timer)
             if now >= _next_poll:
