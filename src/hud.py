@@ -22,6 +22,11 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable
 
+try:
+    import keyboard          # captura SPACE global (independe de foco da janela)
+except Exception:            # pragma: no cover
+    keyboard = None
+
 
 _BG       = "#1a1a1a"
 _PANEL    = "#222"
@@ -51,6 +56,9 @@ class HUD:
         on_state_change: Callable[[object], None],
         get_active: Callable[[], bool],
         resolutions: list = None,
+        get_resolution: Callable[[], tuple] = None,
+        capture_ratio: Callable[[], tuple] = None,
+        save_mapping: Callable[[int, int, dict], None] = None,
     ):
         self._runtime    = settings
         self._hud_state  = hud_state
@@ -61,13 +69,17 @@ class HUD:
         self._on_state   = on_state_change
         self._get_active = get_active
         self._resolutions = resolutions or []
+        self._get_res     = get_resolution
+        self._capture     = capture_ratio
+        self._save_map    = save_mapping
 
         # working copy
         self._working = self._load_prof(self._hud_state.active_profile)
         self._active  = self._hud_state.active_profile
 
         # tk state
-        self.root        = None
+        self.root        = None   # driver invisivel (event loop)
+        self.win         = None   # janela de config (Toplevel destruivel)
         self.visible     = True
         self._drag_x     = 0
         self._drag_y     = 0
@@ -90,6 +102,18 @@ class HUD:
         self._last_active_state = None
         self._shutdown_pending = False
         self._destroyed = False
+        # resolucao (RES tab + wizard)
+        self._res_cur_lbl  = None   # "Sua resolucao atual: WxH"
+        self._res_stat_lbl = None   # mapeada / nao-mapeada
+        self._res_list_lbl = None   # lista de mapeadas
+        self._res_combo    = None
+        self._last_res     = None   # ultima (w,h) detectada (evita refresh redundante)
+        self._res_poll_ctr = 0
+        self._wizard       = None
+        # mini-badge permanente (Executando/Parado) — assume apos a 1a ativacao
+        self._mini        = None
+        self._mini_lbl    = None
+        self._badge_state = None
 
     # ── thread entrypoint ─────────────────────────────────────────────────
     def run(self):
@@ -115,14 +139,15 @@ class HUD:
 
     # ── build ─────────────────────────────────────────────────────────────
     def _build(self):
+        # Root = driver invisivel. Nunca aparece — so mantem o event loop vivo.
+        # A janela de config (self.win) e um Toplevel destruivel: quando o macro
+        # liga, self.win e DESTRUIDO (HUD some de verdade) e so o badge sobra;
+        # o root segue rodando o loop e o badge.
         self.root = tk.Tk()
         self.root.title("d")
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", _ALPHA)
-        self.root.configure(bg=_BG)
+        self.root.withdraw()
 
-        # ttk theme tweaks (combobox dark)
+        # ttk theme tweaks (combobox dark) — global ao interpretador
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
@@ -147,13 +172,37 @@ class HUD:
         self.root.option_add("*TCombobox*Listbox.selectBackground", _ACTIVE)
         self.root.option_add("*TCombobox*Listbox.selectForeground", "white")
 
-        sw = self.root.winfo_screenwidth()
+        # Se o macro ja estiver ativo na subida, nem cria a config — so o badge.
+        if self._safe_get_active():
+            self._show_mini()
+            self._update_badge(True)
+        else:
+            self._build_config()
+
+    def _build_config(self):
+        """(Re)constroi a janela de config (self.win) do zero. Chamado no startup
+        e ao desligar o macro (pra HUD voltar). Reseta todos os widget-dicts."""
+        self._tk_vars   = {}
+        self._tab_btns  = {}
+        self._tab_frames = {}
+        self._prof_btns = {}
+        self._cd_vars   = {}
+        self.visible    = True
+
+        self.win = tk.Toplevel(self.root)
+        self.win.title("d")
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.attributes("-alpha", _ALPHA)
+        self.win.configure(bg=_BG)
+
+        sw = self.win.winfo_screenwidth()
         x = self._hud_state.hud_x if self._hud_state.hud_x >= 0 else (sw - _W - 20)
         y = self._hud_state.hud_y if self._hud_state.hud_y >= 0 else 40
-        self.root.geometry(f"{_W}x{_H}+{x}+{y}")
+        self.win.geometry(f"{_W}x{_H}+{x}+{y}")
 
         # ── header (drag) ──
-        hdr = tk.Frame(self.root, bg=_ACCENT, height=28)
+        hdr = tk.Frame(self.win, bg=_ACCENT, height=28)
         hdr.pack(fill="x")
         tk.Label(hdr, text="settings", bg=_ACCENT, fg="white",
                  font=("Segoe UI", 10, "bold")).pack(side="left", padx=10, pady=5)
@@ -165,7 +214,7 @@ class HUD:
             w.bind("<ButtonRelease-1>", self._drag_end)
 
         # ── status ──
-        st_frame = tk.Frame(self.root, bg=_BG)
+        st_frame = tk.Frame(self.win, bg=_BG)
         st_frame.pack(fill="x", pady=(4, 4))
         self._status_lbl = tk.Label(
             st_frame, text="—", bg=_BG, fg=_MUTED,
@@ -173,7 +222,7 @@ class HUD:
         self._status_lbl.pack()
 
         # ── tabs ──
-        tabs_bar = tk.Frame(self.root, bg=_PANEL)
+        tabs_bar = tk.Frame(self.win, bg=_PANEL)
         tabs_bar.pack(fill="x")
         for tab in _TABS:
             b = tk.Button(
@@ -186,7 +235,7 @@ class HUD:
             self._tab_btns[tab] = b
 
         # ── content ──
-        content = tk.Frame(self.root, bg=_BG)
+        content = tk.Frame(self.win, bg=_BG)
         content.pack(fill="both", expand=True, padx=10, pady=(6, 0))
         self._build_combate(self._make_tab(content, "COMBATE"))
         self._build_pot(self._make_tab(content, "POT"))
@@ -194,8 +243,8 @@ class HUD:
         self._build_res(self._make_tab(content, "RES"))
 
         # ── footer ──
-        tk.Frame(self.root, bg="#2a2a2a", height=1).pack(fill="x", pady=(8, 0))
-        footer = tk.Frame(self.root, bg=_BG)
+        tk.Frame(self.win, bg="#2a2a2a", height=1).pack(fill="x", pady=(8, 0))
+        footer = tk.Frame(self.win, bg=_BG)
         footer.pack(fill="x", padx=10, pady=(6, 10))
 
         self._editing_lbl = tk.Label(footer, text="", bg=_BG, fg=_MUTED,
@@ -358,12 +407,39 @@ class HUD:
     # ── RES ───────────────────────────────────────────────────────────────
     def _build_res(self, frame):
         self._section_title(frame, "Resolucao")
+
+        # Resolucao atual do jogo (live, atualizada no _tick)
+        cur_box = tk.Frame(frame, bg=_PANEL)
+        cur_box.pack(fill="x", pady=(0, 6))
+        tk.Label(cur_box, text="Sua resolucao atual:", bg=_PANEL, fg=_MUTED,
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=8, pady=(6, 0))
+        self._res_cur_lbl = tk.Label(cur_box, text="detectando...", bg=_PANEL,
+                                     fg="white", font=("Segoe UI", 13, "bold"))
+        self._res_cur_lbl.pack(anchor="w", padx=8, pady=(0, 6))
+
+        # Status: mapeada / nao mapeada
+        self._res_stat_lbl = tk.Label(frame, text="", bg=_BG, fg=_MUTED,
+                                      font=("Segoe UI", 9, "bold"),
+                                      wraplength=290, justify="left")
+        self._res_stat_lbl.pack(anchor="w", pady=(0, 6))
+
+        # Botao Mapear
+        map_btn = tk.Button(
+            frame, text="Mapear resolucao", bg=_ACCENT, fg="white", bd=0,
+            relief="flat", font=("Segoe UI", 10, "bold"),
+            activebackground=_ACTIVE, activeforeground="white",
+            takefocus=0, command=self._open_map_wizard,
+        )
+        map_btn.pack(fill="x", ipady=5, pady=(0, 10))
+
+        tk.Frame(frame, bg="#2a2a2a", height=1).pack(fill="x", pady=(0, 8))
+
         tk.Label(
-            frame, text="Forca o profile de calibracao usado pelo macro.\n"
-                        "Auto = detecta a resolucao mais proxima.",
+            frame, text="Profile usado pelo macro:\n"
+                        "Auto = segue a resolucao atual do jogo.",
             bg=_BG, fg=_MUTED, font=("Segoe UI", 8),
             wraplength=290, justify="left",
-        ).pack(anchor="w", pady=(0, 6))
+        ).pack(anchor="w", pady=(0, 4))
 
         cur = getattr(self._working, "forced_resolution", "auto")
         v = tk.StringVar(value=cur if cur else "auto")
@@ -373,14 +449,86 @@ class HUD:
         cmb.pack(anchor="w", pady=4)
         cmb.bind("<<ComboboxSelected>>", lambda e: self._mark_dirty())
         self._tk_vars["forced_resolution"] = v
+        self._res_combo = cmb
 
-        tk.Label(
+        self._res_list_lbl = tk.Label(
             frame,
             text="Mapeadas: " + (", ".join(self._resolutions) if self._resolutions
-                                  else "(nenhuma)"),
+                                 else "(nenhuma)"),
             bg=_BG, fg=_MUTED, font=("Segoe UI", 8),
             wraplength=290, justify="left",
-        ).pack(anchor="w", pady=(8, 0))
+        )
+        self._res_list_lbl.pack(anchor="w", pady=(8, 0))
+
+    # ── resolucao: poll + status ──────────────────────────────────────────
+    def _refresh_res_status(self):
+        """Atualiza o label 'sua resolucao atual' + status mapeada/nao-mapeada.
+        Chamado no _tick (~1s). Detecta troca de resolucao do jogo em tempo real."""
+        if self._get_res is None or self._res_cur_lbl is None:
+            return
+        try:
+            res = self._get_res()
+        except Exception:
+            res = None
+        if res == self._last_res:
+            return
+        self._last_res = res
+        if not res:
+            self._res_cur_lbl.config(text="jogo nao encontrado", fg=_MUTED)
+            self._res_stat_lbl.config(text="", fg=_MUTED)
+            return
+        w, h = res
+        key = f"{w}x{h}"
+        self._res_cur_lbl.config(text=key, fg="white")
+        if key in self._resolutions:
+            self._res_stat_lbl.config(
+                text="✓ Resolucao mapeada", fg=_SUCCESS)
+        else:
+            self._res_stat_lbl.config(
+                text="⚠ Resolucao NAO mapeada\nClique em 'Mapear resolucao'.",
+                fg="#f0b132")
+
+    def _refresh_res_widgets(self):
+        """Repopula dropdown + lista de mapeadas apos um novo mapeamento."""
+        opts = ["auto"] + list(self._resolutions)
+        if self._res_combo is not None:
+            self._res_combo.config(values=opts)
+        if self._res_list_lbl is not None:
+            self._res_list_lbl.config(
+                text="Mapeadas: " + (", ".join(self._resolutions)
+                                     if self._resolutions else "(nenhuma)"))
+        self._last_res = None       # forca _refresh_res_status a reavaliar
+        self._refresh_res_status()
+
+    def _open_map_wizard(self):
+        if self._wizard is not None:
+            return
+        if self._get_res is None or self._capture is None or self._save_map is None:
+            return
+        try:
+            res = self._get_res()
+        except Exception:
+            res = None
+        if not res:
+            self._res_stat_lbl.config(
+                text="⚠ Jogo nao encontrado. Abra o PT EU antes de mapear.",
+                fg=_DANGER)
+            return
+        self._wizard = _MapWizard(self, res)
+
+    def _on_mapping_done(self, w, h, prof):
+        """Callback do wizard ao concluir — persiste e atualiza a UI."""
+        self._wizard = None
+        if prof is None:
+            return
+        try:
+            self._save_map(w, h, prof)
+        except Exception:
+            pass
+        key = f"{w}x{h}"
+        if key not in self._resolutions:
+            self._resolutions.append(key)
+        self._refresh_res_widgets()
 
     def _section_title(self, parent, text):
         tk.Label(parent, text=text, bg=_BG, fg=_FG,
@@ -403,10 +551,6 @@ class HUD:
         self._working = self._load_prof(name)
         self._active = name
         self._reload_vars_from_working()
-        # refresh comboboxes + icones
-        for fk in ("f1", "f2", "f3", "f4"):
-            self._refresh_skill_options(fk)
-            self._refresh_skill_icon(fk)
         self._dirty = False
         self._rename_var.set(self._display_name(self._active))
         self._highlight_active_profile()
@@ -532,17 +676,17 @@ class HUD:
 
     # ── drag ──────────────────────────────────────────────────────────────
     def _drag_start(self, e):
-        self._drag_x = e.x_root - self.root.winfo_x()
-        self._drag_y = e.y_root - self.root.winfo_y()
+        self._drag_x = e.x_root - self.win.winfo_x()
+        self._drag_y = e.y_root - self.win.winfo_y()
 
     def _drag_move(self, e):
         x = e.x_root - self._drag_x
         y = e.y_root - self._drag_y
-        self.root.geometry(f"+{x}+{y}")
+        self.win.geometry(f"+{x}+{y}")
 
     def _drag_end(self, e):
-        self._hud_state.hud_x = self.root.winfo_x()
-        self._hud_state.hud_y = self.root.winfo_y()
+        self._hud_state.hud_x = self.win.winfo_x()
+        self._hud_state.hud_y = self.win.winfo_y()
         try:
             self._on_state(self._hud_state)
         except Exception:
@@ -553,6 +697,56 @@ class HUD:
             return bool(self._get_active())
         except Exception:
             return False
+
+    # ── mini-badge (Executando / Parado) ──────────────────────────────────
+    def _kill_config(self):
+        """Mata a janela de config DE VEZ. Apos isso a config nunca mais volta —
+        so o badge permanece, alternando Executando/Parado."""
+        if self.win is not None:
+            try:
+                self.win.destroy()
+            except Exception:
+                pass
+            self.win = None
+
+    def _show_mini(self):
+        """Cria o badge permanente (uma unica vez)."""
+        if self._mini is not None:
+            return
+        try:
+            m = tk.Toplevel(self.root)
+            m.overrideredirect(True)
+            m.attributes("-topmost", True)
+            m.attributes("-alpha", 0.92)
+            m.configure(bg=_SUCCESS)
+            lbl = tk.Label(m, text="●", bg=_SUCCESS, fg="white",
+                           font=("Segoe UI", 9, "bold"), padx=12, pady=5)
+            lbl.pack()
+            self._mini = m
+            self._mini_lbl = lbl
+        except Exception:
+            self._mini = None
+            self._mini_lbl = None
+
+    def _update_badge(self, active: bool):
+        """Atualiza texto/cor do badge conforme o estado. So reescreve na mudanca."""
+        if self._mini is None or self._mini_lbl is None:
+            return
+        state = bool(active)
+        if self._badge_state == state:
+            return
+        self._badge_state = state
+        bg = _SUCCESS if state else _DANGER
+        txt = "● Executando" if state else "● Parado"
+        try:
+            self._mini.configure(bg=bg)
+            self._mini_lbl.configure(text=txt, bg=bg)
+            self._mini.update_idletasks()
+            sw = self._mini.winfo_screenwidth()
+            bw = self._mini.winfo_reqwidth()
+            self._mini.geometry(f"+{sw - bw - 12}+12")   # canto superior direito
+        except Exception:
+            pass
 
     # ── tick ──────────────────────────────────────────────────────────────
     def _tick(self):
@@ -566,21 +760,197 @@ class HUD:
             except Exception:
                 pass
             return
+        active = self._safe_get_active()
+        # Ctrl+J so alterna a janela de config ENQUANTO ela existe (antes do macro
+        # ligar pela 1a vez). Depois que o badge assume, Ctrl+J nao faz nada.
         if self._toggle_pending:
             self._toggle_pending = False
-            self.visible = not self.visible
+            if self.win is not None:
+                self.visible = not self.visible
+                try:
+                    if self.visible:
+                        self.win.attributes("-alpha", _ALPHA)
+                        self.win.attributes("-disabled", False)
+                    else:
+                        self.win.attributes("-alpha", 0.0)
+                        self.win.attributes("-disabled", True)
+                except Exception:
+                    pass
+        # 1a ativacao: mata a config DE VEZ e cria o badge permanente.
+        if active and self.win is not None:
+            self._kill_config()
+            self._show_mini()
+        # Badge permanente: a partir daqui so alterna Executando/Parado.
+        if self._mini is not None:
+            self._update_badge(active)
+        # Status + poll de resolucao so enquanto a config existe (antes de ligar).
+        if self.win is not None:
+            self._update_status(active)
+            self._res_poll_ctr += 1
+            if self._res_poll_ctr >= 5:
+                self._res_poll_ctr = 0
+                self._refresh_res_status()
+        if self._wizard is not None:
+            self._wizard.poll()
+        self.root.after(200, self._tick)
+
+
+# ── Wizard de mapeamento de resolucao ─────────────────────────────────────
+class _MapWizard:
+    """Modal pra mapear barras (HP/SP/MP) e slots de pote de uma resolucao.
+
+    Captura SPACE GLOBALMENTE via keyboard lib — funciona mesmo com o PT EU em
+    foco (o usuario mira no jogo, o HUD nem precisa ter foco). O botao Cancelar
+    tem takefocus=0 pra nunca roubar o SPACE.
+    """
+
+    _STEPS = (
+        ("Barra de VIDA — mire no TOPO da barra",     'top'),
+        ("Barra de VIDA — mire na BASE da barra",     'bot'),
+        ("Barra de STAMINA — mire no TOPO da barra",  'top'),
+        ("Barra de STAMINA — mire na BASE da barra",  'bot'),
+        ("Barra de MANA — mire no TOPO da barra",     'top'),
+        ("Barra de MANA — mire na BASE da barra",     'bot'),
+        ("Pote de VIDA — mire no CENTRO do slot",     'pt'),
+        ("Pote de STAMINA — mire no CENTRO do slot",  'pt'),
+        ("Pote de MANA — mire no CENTRO do slot",     'pt'),
+    )
+
+    def __init__(self, hud: "HUD", res: tuple):
+        self._hud   = hud
+        self._w, self._h = int(res[0]), int(res[1])
+        self._step  = 0
+        self._pts   = []          # lista de (rx, ry) na ordem dos steps
+        self._pending = False     # setado pela thread do keyboard, lido no poll()
+        self._hk    = None
+        self._done  = False
+
+        self.win = tk.Toplevel(hud.root)
+        self.win.title("map")
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.attributes("-alpha", 0.95)
+        self.win.configure(bg=_BG)
+        # canto superior-esquerdo — longe das barras (base) e potes (centro-baixo)
+        self.win.geometry("330x210+30+30")
+
+        tk.Label(self.win, bg=_ACCENT, fg="white", height=1,
+                 text=f"Mapeando  {self._w}x{self._h}",
+                 font=("Segoe UI", 10, "bold")).pack(fill="x")
+
+        self._instr = tk.Label(self.win, bg=_BG, fg="white", wraplength=300,
+                                justify="center", font=("Segoe UI", 11, "bold"))
+        self._instr.pack(pady=(14, 4), padx=10)
+
+        tk.Label(self.win, bg=_BG, fg=_MUTED, wraplength=300, justify="center",
+                 text="Posicione o mouse SOBRE o jogo e tecle ESPACO.",
+                 font=("Segoe UI", 8)).pack(padx=10)
+
+        self._prog = tk.Label(self.win, bg=_BG, fg=_ACCENT,
+                              font=("Segoe UI", 9, "bold"))
+        self._prog.pack(pady=(8, 0))
+
+        self._last = tk.Label(self.win, bg=_BG, fg=_MUTED, font=("Segoe UI", 8))
+        self._last.pack()
+
+        btns = tk.Frame(self.win, bg=_BG)
+        btns.pack(side="bottom", fill="x", padx=10, pady=10)
+        tk.Button(btns, text="Voltar", bg=_PANEL, fg=_FG, bd=0, relief="flat",
+                  font=("Segoe UI", 9), activebackground=_ACTIVE,
+                  activeforeground="white", takefocus=0,
+                  command=self._back).pack(side="left", expand=True, fill="x", padx=(0, 3))
+        tk.Button(btns, text="Cancelar", bg=_DANGER, fg="white", bd=0, relief="flat",
+                  font=("Segoe UI", 9), activebackground="#a33",
+                  activeforeground="white", takefocus=0,
+                  command=self._cancel).pack(side="left", expand=True, fill="x", padx=(3, 0))
+
+        # hook global de SPACE (suppress evita que o jogo receba o espaco)
+        if keyboard is not None:
             try:
-                if self.visible:
-                    self.root.attributes("-alpha", _ALPHA)
-                    self.root.attributes("-disabled", False)
-                else:
-                    self.root.attributes("-alpha", 0.0)
-                    self.root.attributes("-disabled", True)
+                self._hk = keyboard.add_hotkey("space", self._on_space,
+                                               suppress=True, trigger_on_release=False)
+            except Exception:
+                self._hk = None
+        # fallback local (so funciona com o wizard em foco)
+        self.win.bind("<space>", lambda e: self._on_space())
+        self.win.bind("<Escape>", lambda e: self._cancel())
+
+        self._render()
+
+    # keyboard thread → so seta flag (tk nao e thread-safe)
+    def _on_space(self):
+        self._pending = True
+
+    # chamado no _tick do HUD (thread tk) — processa captura pendente
+    def poll(self):
+        if self._done or not self._pending:
+            return
+        self._pending = False
+        self._capture_current()
+
+    def _capture_current(self):
+        if self._hud._capture is None:
+            return
+        try:
+            pt = self._hud._capture()
+        except Exception:
+            pt = None
+        if pt is None:
+            self._last.config(text="cursor fora da janela do jogo — tente de novo",
+                              fg=_DANGER)
+            return
+        self._pts.append(pt)
+        self._last.config(text=f"capturado: ({pt[0]:.3f}, {pt[1]:.3f})", fg=_SUCCESS)
+        self._step += 1
+        if self._step >= len(self._STEPS):
+            self._finish()
+        else:
+            self._render()
+
+    def _back(self):
+        if self._step == 0:
+            return
+        self._step -= 1
+        if self._pts:
+            self._pts.pop()
+        self._last.config(text="", fg=_MUTED)
+        self._render()
+
+    def _render(self):
+        if self._step >= len(self._STEPS):
+            return
+        txt, _ = self._STEPS[self._step]
+        self._instr.config(text=txt)
+        self._prog.config(text=f"Passo {self._step + 1} de {len(self._STEPS)}")
+
+    def _finish(self):
+        p = self._pts
+        prof = {
+            'ZA': (p[0][0], p[0][1], p[1][1]),
+            'ZB': (p[2][0], p[2][1], p[3][1]),
+            'ZC': (p[4][0], p[4][1], p[5][1]),
+            'PA': (p[6][0], p[6][1]),
+            'PB': (p[7][0], p[7][1]),
+            'PC': (p[8][0], p[8][1]),
+        }
+        self._teardown()
+        self._hud._on_mapping_done(self._w, self._h, prof)
+
+    def _cancel(self):
+        self._teardown()
+        self._hud._on_mapping_done(self._w, self._h, None)
+
+    def _teardown(self):
+        if self._done:
+            return
+        self._done = True
+        if self._hk is not None and keyboard is not None:
+            try:
+                keyboard.remove_hotkey(self._hk)
             except Exception:
                 pass
-        # Auto-shutdown: assim que o macro vira active, destroi HUD
-        active = self._safe_get_active()
-        if active and not self._last_active_state:
-            self._shutdown_pending = True
-        self._update_status(active)
-        self.root.after(200, self._tick)
+            self._hk = None
+        try:
+            self.win.destroy()
+        except Exception:
+            pass

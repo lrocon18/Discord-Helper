@@ -1,3 +1,6 @@
 .claude/
 customization/
 discord.log
+.agents
+__pycache__/
+*.pyc

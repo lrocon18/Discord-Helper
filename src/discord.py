@@ -38,6 +38,7 @@ _log_path  = os.path.join(_base_dir, _s(_ENC_LOG))
 
 _CFG_DIR     = os.path.join(_base_dir, "customization")
 _STATE_FILE  = os.path.join(_CFG_DIR, "state.json")
+_RES_FILE    = os.path.join(_CFG_DIR, "resolutions.json")
 _PROFILES    = ("profile1", "profile2", "profile3")
 
 
@@ -384,6 +385,80 @@ def _apply_resolution_profile(w: int, h: int) -> tuple | None:
     _CUR_PROFILE = target
     return target
 
+
+def _load_resolutions() -> None:
+    """Funde os profiles mapeados pelo usuario (resolutions.json) em _RES_PROFILES.
+    Chamado no import — sobrescreve built-ins se o usuario remapeou a mesma WxH."""
+    try:
+        with open(_RES_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return
+    for key, prof in d.items():
+        wh = _parse_resolution(key)
+        if not wh or not isinstance(prof, dict):
+            continue
+        try:
+            _RES_PROFILES[wh] = {k: tuple(v) for k, v in prof.items()}
+        except Exception:
+            continue
+
+
+def _save_resolution_mapping(w: int, h: int, prof: dict) -> None:
+    """Persiste um profile recem-mapeado em resolutions.json e funde no runtime.
+    Serializa TODO _RES_PROFILES (built-ins + custom) pra um unico arquivo."""
+    global _CUR_PROFILE
+    try:
+        _RES_PROFILES[(int(w), int(h))] = {k: tuple(v) for k, v in prof.items()}
+        _CUR_PROFILE = None   # forca probe_loop a reaplicar
+        os.makedirs(_CFG_DIR, exist_ok=True)
+        out = {f"{ww}x{hh}": {k: list(v) for k, v in p.items()}
+               for (ww, hh), p in _RES_PROFILES.items()}
+        with open(_RES_FILE, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2)
+        _log(f"[CFG] resolution mapped {w}x{h} -> {prof}")
+    except Exception as e:
+        _log(f"[ERR] save resolution {w}x{h}: {e}")
+
+
+def _current_resolution() -> tuple | None:
+    """(w, h) do viewport do jogo agora, ou None se a janela nao for encontrada.
+    Usado pela HUD pra exibir 'Sua resolucao atual' (poll a cada ~1s)."""
+    hwnd = _locate_window()
+    if not hwnd:
+        return None
+    dims = _query_viewport(hwnd)
+    if not dims:
+        return None
+    return (dims[0], dims[1])
+
+
+def _resolution_is_mapped(w: int, h: int) -> bool:
+    return (int(w), int(h)) in _RES_PROFILES
+
+
+def _capture_ratio() -> tuple | None:
+    """Posicao atual do cursor como ratio (rx, ry) relativo ao viewport do jogo.
+    None se a janela nao existe ou o cursor esta fora dela. Usado pelo wizard de
+    mapeamento — converte clique de tela em coordenada resolucao-independente."""
+    hwnd = _locate_window()
+    if not hwnd:
+        return None
+    dims = _query_viewport(hwnd)
+    if not dims:
+        return None
+    w, h, ox, oy = dims
+    pt = wt.POINT()
+    if not user32.GetCursorPos(ctypes.byref(pt)):
+        return None
+    rx = (pt.x - ox) / w
+    ry = (pt.y - oy) / h
+    if not (0.0 <= rx <= 1.0 and 0.0 <= ry <= 1.0):
+        return None
+    return (round(rx, 4), round(ry, 4))
+
+
+_load_resolutions()   # funde profiles custom de resolutions.json sobre os built-ins
 
 _THR_A = 0.50    # legacy ratio (used in _thresh_px for slot-empty calc)
 _THR_B = 0.10
@@ -1620,6 +1695,9 @@ def main() -> None:
         on_state_change=_save_hud_state,
         get_active=_is_active,
         resolutions=resolution_keys(),
+        get_resolution=_current_resolution,
+        capture_ratio=_capture_ratio,
+        save_mapping=_save_resolution_mapping,
     )
     threading.Thread(target=_hud.run, daemon=True, name=_tname()).start()
     _hud.wait_ready(timeout=3.0)
