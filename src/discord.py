@@ -1725,7 +1725,9 @@ def main() -> None:
     threading.Thread(target=_idle_tick,       daemon=True, name=_tname()).start()
     threading.Thread(target=_sync_scheduler,  daemon=True, name=_tname()).start()
     threading.Thread(target=_probe_loop,      daemon=True, name=_tname()).start()
-    threading.Thread(target=_soul_loop,       daemon=True, name=_tname()).start()
+    # DESABILITADO p/ analise — scan de Soul off pra medir o pot isolado.
+    # Reabilitar: descomentar a linha abaixo.
+    # threading.Thread(target=_soul_loop,       daemon=True, name=_tname()).start()
     threading.Thread(target=_aux_loop,        daemon=True, name=_tname()).start()
     threading.Thread(target=_buff_monitor,    daemon=True, name=_tname()).start()
 
