@@ -292,8 +292,6 @@ HUD_VK    = 0x4A   # J — toggle HUD visibility
 _POT_CD_LO = 0.01
 _POT_CD_HI = 0.02
 
-_EMPTY_ALERT_CD = 30.0  # seconds between empty-slot warnings per slot
-
 _AUX_CD      = 10.0   # fixed game cooldown (seconds)
 _AUX_JIT_LO  = 2.0    # human jitter range after cooldown
 _AUX_JIT_HI  = 5.0
@@ -718,20 +716,27 @@ def _scan_hud(hdc_src, w: int, h: int, ox: int, oy: int) -> tuple[int, int, int]
     hp_x = sp_x = mp_x = None
     x_lo = int(w * 0.38)
     x_hi = int(w * 0.62)
-    for ry in (0.9875, 0.9885, 0.9895):
-        sy = oy + int(ry * h)
-        for bx in range(x_lo, x_hi):
-            r, g, b = _read_px(hdc_src, ox + bx, sy)
-            if r == -1:
-                continue
-            if hp_x is None and r > 160 and r > g * 2.5 and r > b * 2.5:
-                hp_x = ox + bx
-            if sp_x is None and g > 140 and g > r * 2.5 and g > b * 2.5:
-                sp_x = ox + bx
-            if mp_x is None and r < 50 and b > 100:
-                mp_x = ox + bx
-        if hp_x is not None and sp_x is not None and mp_x is not None:
-            break
+    bw = x_hi - x_lo
+    # 1 BitBlt da faixa inteira (3 linhas) + varredura na MEMORIA — substitui
+    # ~1380 GetPixel por pixel (que em VM custam readback de GPU, ~segundos).
+    rows = [oy + int(ry * h) for ry in (0.9875, 0.9885, 0.9895)]
+    y0 = min(rows)
+    band_h = max(rows) - y0 + 1
+    cap = _capture_region(hdc_src, ox + x_lo, y0, bw, band_h) if bw > 0 else None
+    if cap is not None:
+        for ry_abs in rows:
+            row_off = (ry_abs - y0) * bw * 4   # BGRX, 4 bytes/px, top-down
+            for bx in range(bw):
+                o = row_off + bx * 4
+                b = cap[o]; g = cap[o+1]; r = cap[o+2]
+                if hp_x is None and r > 160 and r > g * 2.5 and r > b * 2.5:
+                    hp_x = ox + x_lo + bx
+                if sp_x is None and g > 140 and g > r * 2.5 and g > b * 2.5:
+                    sp_x = ox + x_lo + bx
+                if mp_x is None and r < 50 and b > 100:
+                    mp_x = ox + x_lo + bx
+            if hp_x is not None and sp_x is not None and mp_x is not None:
+                break
     fb_hp = hp_x is None
     fb_sp = sp_x is None
     fb_mp = mp_x is None
@@ -1301,7 +1306,6 @@ user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
 def _probe_loop() -> None:
     try:
         last_pot          = {'1': 0.0, '2': 0.0, '3': 0.0}
-        last_empty_alert  = {'1': 0.0, '2': 0.0, '3': 0.0}
         _hwnd             = None
         _dims             = None
         _bar_xs           = None
@@ -1398,8 +1402,7 @@ def _probe_loop() -> None:
                     f"s3e={_empty(_slot_empty_tmpl[2], s3_c)}"
                 )
 
-            def _try_pot(key: str, pct: int, thr: int, slot_idx: int, slot_c,
-                         last_pot_d, last_empty_d, label: str):
+            def _try_pot(key: str, pct: int, thr: int, last_pot_d, label: str):
                 # Sem gate de slot-vazio: o cache de 5s do slot-empty estava
                 # falsamente marcando o slot como vazio apos usar a pot (visual
                 # de cooldown), skipando a proxima pot por ate 5s. Agora dispara
@@ -1422,21 +1425,18 @@ def _probe_loop() -> None:
                     except Exception as e:
                         _log(f"[ERR] {label} send_key EXC: {type(e).__name__}: {e}")
 
-            # Prioridade absoluta: HP. Se HP baixa, NAO toca SP/MP nesse tick.
+            # Cada barra que cruza o threshold dispara IMEDIATAMENTE, todas no
+            # mesmo tick. HP vai primeiro (prioridade na ordem), mas SP/MP nao
+            # esperam — se varias precisam, todas sao usadas.
             hp_low = hp_pct < _settings.pot_hp_pct
             state.hp_critical = hp_low and hp_pct <= max(1, _settings.pot_hp_pct // 2)
 
             if hp_low:
-                _try_pot('1', hp_pct, _settings.pot_hp_pct, 0, s1_c,
-                         last_pot, last_empty_alert, 'hp')
-            else:
-                # HP ok — pode tratar SP/MP normalmente
-                if sp_pct < _settings.pot_sp_pct:
-                    _try_pot('2', sp_pct, _settings.pot_sp_pct, 1, s2_c,
-                             last_pot, last_empty_alert, 'sp')
-                if mp_pct < _settings.pot_mp_pct:
-                    _try_pot('3', mp_pct, _settings.pot_mp_pct, 2, s3_c,
-                             last_pot, last_empty_alert, 'mp')
+                _try_pot('1', hp_pct, _settings.pot_hp_pct, last_pot, 'hp')
+            if sp_pct < _settings.pot_sp_pct:
+                _try_pot('2', sp_pct, _settings.pot_sp_pct, last_pot, 'sp')
+            if mp_pct < _settings.pot_mp_pct:
+                _try_pot('3', mp_pct, _settings.pot_mp_pct, last_pot, 'mp')
 
             # (scan de Soul movido pra _soul_loop, thread separada — antes ele
             #  bloqueava o pot por segundos a cada poll de 1s)
