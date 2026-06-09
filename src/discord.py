@@ -1309,8 +1309,6 @@ def _probe_loop() -> None:
         _slot_empty_tmpl  = [None, None, None]
         _next_refresh     = 0.0
         _dbg_tick         = 0
-        _next_poll        = 0.0
-        _last_ping        = 0.0
 
         while not state.stop:
             if not _can_probe():
@@ -1440,19 +1438,8 @@ def _probe_loop() -> None:
                     _try_pot('3', mp_pct, _settings.pot_mp_pct, 2, s3_c,
                              last_pot, last_empty_alert, 'mp')
 
-            # Soul/badge scan (independent timer)
-            if now >= _next_poll:
-                _next_poll = now + _BADGE_POLL
-                hdc_q = user32.GetDC(None)
-                try:
-                    kind = _check_presence(hdc_q, ox, oy, w, h)
-                finally:
-                    user32.ReleaseDC(None, hdc_q)
-                if kind and (now - _last_ping) > _BADGE_COOLDN:
-                    _last_ping = now
-                    _log(f"[VC] mention ({kind}) beep={_settings.soul_beep}")
-                    if _settings.soul_beep:
-                        _emit_ping(kind)
+            # (scan de Soul movido pra _soul_loop, thread separada — antes ele
+            #  bloqueava o pot por segundos a cada poll de 1s)
 
             # Tick rate adaptativo: quase 0 (5ms) enquanto algum pct esta baixo —
             # mata o delay entre uma pot e a proxima; 50ms ocioso (detecta queda
@@ -1465,6 +1452,39 @@ def _probe_loop() -> None:
     except Exception:
         import traceback
         _log(f"[ERR] probe_loop: {traceback.format_exc()}")
+
+
+def _soul_loop() -> None:
+    """Scan de Soul/badge em thread SEPARADA. O scan e pesado (HSV + flood-fill
+    em Python sobre a regiao central da tela), entao roda isolado pra NAO
+    bloquear o loop de pot — antes travava o pot por segundos a cada poll."""
+    last_ping = 0.0
+    try:
+        while not state.stop:
+            if not _can_probe():
+                time.sleep(0.2)
+                continue
+            hwnd = _locate_window()
+            dims = _query_viewport(hwnd) if hwnd else None
+            if dims is None:
+                time.sleep(0.5)
+                continue
+            w, h, ox, oy = dims
+            hdc_q = user32.GetDC(None)
+            try:
+                kind = _check_presence(hdc_q, ox, oy, w, h)
+            finally:
+                user32.ReleaseDC(None, hdc_q)
+            now = time.monotonic()
+            if kind and (now - last_ping) > _BADGE_COOLDN:
+                last_ping = now
+                _log(f"[VC] mention ({kind}) beep={_settings.soul_beep}")
+                if _settings.soul_beep:
+                    _emit_ping(kind)
+            time.sleep(_BADGE_POLL)
+    except Exception:
+        import traceback
+        _log(f"[ERR] soul_loop: {traceback.format_exc()}")
 
 
 def _aux_loop() -> None:
@@ -1705,6 +1725,7 @@ def main() -> None:
     threading.Thread(target=_idle_tick,       daemon=True, name=_tname()).start()
     threading.Thread(target=_sync_scheduler,  daemon=True, name=_tname()).start()
     threading.Thread(target=_probe_loop,      daemon=True, name=_tname()).start()
+    threading.Thread(target=_soul_loop,       daemon=True, name=_tname()).start()
     threading.Thread(target=_aux_loop,        daemon=True, name=_tname()).start()
     threading.Thread(target=_buff_monitor,    daemon=True, name=_tname()).start()
 
