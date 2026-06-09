@@ -287,10 +287,13 @@ TOGGLE_VK = 0x4B   # K — toggle active
 CLOSE_VK  = 0x4C   # L — close
 HUD_VK    = 0x4A   # J — toggle HUD visibility
 
-# CD minimo entre pots — reduzido ao minimo (quase 0). Gauss 10-20ms entre
-# disparos do mesmo slot, so pra manter um micro-jitter (evita padrao perfeito).
-_POT_CD_LO = 0.01
-_POT_CD_HI = 0.02
+# Micro-reacao humana antes de cada pot (gaussiana). Quebra o fingerprint de
+# reacao instantanea/identica do macro (WarningAutoMouse), mas rapida o bastante
+# (media ~55ms) pra nao perder a barra. Tambem espaca disparos seguidos.
+_POT_REACT_MEAN = 0.055
+_POT_REACT_STD  = 0.022
+_POT_REACT_LO   = 0.028
+_POT_REACT_HI   = 0.120
 
 _AUX_CD      = 10.0   # fixed game cooldown (seconds)
 _AUX_JIT_LO  = 2.0    # human jitter range after cooldown
@@ -1305,7 +1308,6 @@ user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
 
 def _probe_loop() -> None:
     try:
-        last_pot          = {'1': 0.0, '2': 0.0, '3': 0.0}
         _hwnd             = None
         _dims             = None
         _bar_xs           = None
@@ -1386,7 +1388,6 @@ def _probe_loop() -> None:
                 user32.ReleaseDC(None, hdc)
 
             _dbg_tick += 1
-            now = time.monotonic()
 
             def _empty(tmpl_r, px_c) -> bool:
                 if tmpl_r is not None:
@@ -1402,41 +1403,35 @@ def _probe_loop() -> None:
                     f"s3e={_empty(_slot_empty_tmpl[2], s3_c)}"
                 )
 
-            def _try_pot(key: str, pct: int, thr: int, last_pot_d, label: str):
-                # Sem gate de slot-vazio: o cache de 5s do slot-empty estava
-                # falsamente marcando o slot como vazio apos usar a pot (visual
-                # de cooldown), skipando a proxima pot por ate 5s. Agora dispara
-                # sempre que a barra cruzar o threshold.
-                dt = now - last_pot_d[key]
-                cd_lim = random.gauss((_POT_CD_LO + _POT_CD_HI) / 2,
-                                      (_POT_CD_HI - _POT_CD_LO) / 4)
-                cd_lim = max(_POT_CD_LO * 0.85, min(_POT_CD_HI * 1.15, cd_lim))
-                if dt < cd_lim:
+            def _try_pot(key: str, pct: int, thr: int, label: str):
+                if not (_ic and _can_probe()):
                     return
-                if _ic and _can_probe():
-                    try:
-                        # hold minimo (10-20ms) — pot quase instantanea, mas tecla
-                        # ainda registra. 2 pots seguidas ja nao esperam ~100ms.
-                        _ic.send_key(key, hold_sec=random.uniform(0.01, 0.02))
-                        last_pot_d[key] = time.monotonic()
-                        critical = pct <= max(1, thr // 2)
-                        tag = "CRIT" if critical else "FIRED"
-                        _log(f"[POT] {label} {tag} pct={pct}% thr={thr}% cd={cd_lim*1000:.0f}ms")
-                    except Exception as e:
-                        _log(f"[ERR] {label} send_key EXC: {type(e).__name__}: {e}")
+                try:
+                    # micro-reacao humana gaussiana antes de apertar — quebra o
+                    # padrao de reacao instantanea/identica; tambem espaca disparos.
+                    react = max(_POT_REACT_LO,
+                                min(_POT_REACT_HI,
+                                    random.gauss(_POT_REACT_MEAN, _POT_REACT_STD)))
+                    time.sleep(react)
+                    _ic.send_key(key, hold_sec=random.uniform(0.02, 0.04))
+                    critical = pct <= max(1, thr // 2)
+                    tag = "CRIT" if critical else "FIRED"
+                    _log(f"[POT] {label} {tag} pct={pct}% thr={thr}% react={react*1000:.0f}ms")
+                except Exception as e:
+                    _log(f"[ERR] {label} send_key EXC: {type(e).__name__}: {e}")
 
-            # Cada barra que cruza o threshold dispara IMEDIATAMENTE, todas no
-            # mesmo tick. HP vai primeiro (prioridade na ordem), mas SP/MP nao
-            # esperam — se varias precisam, todas sao usadas.
+            # Cada barra que cruza o threshold dispara, todas no mesmo tick. HP
+            # vai primeiro (prioridade); SP/MP nao esperam — se varias precisam,
+            # todas sao usadas. Cada uma tem sua micro-reacao gaussiana.
             hp_low = hp_pct < _settings.pot_hp_pct
             state.hp_critical = hp_low and hp_pct <= max(1, _settings.pot_hp_pct // 2)
 
             if hp_low:
-                _try_pot('1', hp_pct, _settings.pot_hp_pct, last_pot, 'hp')
+                _try_pot('1', hp_pct, _settings.pot_hp_pct, 'hp')
             if sp_pct < _settings.pot_sp_pct:
-                _try_pot('2', sp_pct, _settings.pot_sp_pct, last_pot, 'sp')
+                _try_pot('2', sp_pct, _settings.pot_sp_pct, 'sp')
             if mp_pct < _settings.pot_mp_pct:
-                _try_pot('3', mp_pct, _settings.pot_mp_pct, last_pot, 'mp')
+                _try_pot('3', mp_pct, _settings.pot_mp_pct, 'mp')
 
             # (scan de Soul movido pra _soul_loop, thread separada — antes ele
             #  bloqueava o pot por segundos a cada poll de 1s)
