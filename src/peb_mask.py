@@ -1,8 +1,9 @@
 """
-peb_mask.py — Renomeia o processo no PEB (ProcessParameters->ImagePathName
-e CommandLine) para enganar ferramentas que listam processos via NtQueryInformationProcess.
-Não modifica disco, só memória do processo atual.
+peb_mask.py — Deep PEB Unlinking e Ocultação.
+Além de renomear Command Line e ImagePathName, removemos a DLL principal 
+e o .exe da lista LDR (InLoadOrder, InMemoryOrder, InInitializationOrder).
 """
+
 import ctypes
 import ctypes.wintypes as wt
 import sys
@@ -10,29 +11,47 @@ import sys
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 ntdll    = ctypes.WinDLL("ntdll",    use_last_error=False)
 
-# ── estruturas mínimas ────────────────────────────────────────────────────────
+# ── Estruturas PEB/LDR ────────────────────────────────────────────────────────
 
 class UNICODE_STRING(ctypes.Structure):
     _fields_ = [
         ("Length",        wt.USHORT),
         ("MaximumLength", wt.USHORT),
-        # FIX-1: c_void_p em vez de c_wchar_p.
-        # c_wchar_p faz o ctypes achar que é dono desse ponteiro e pode tentar
-        # gerenciar (ou liberar) a memória ao fazer cast — comportamento undefined.
-        # c_void_p é um inteiro bruto de 8 bytes: lê o endereço, não mexe na memória.
         ("Buffer",        ctypes.c_void_p),
     ]
 
-# FIX-2: offset explícito para x64.
-# No Windows x64, RTL_USER_PROCESS_PARAMETERS tem:
-#   0x00–0x5F  campos que não precisamos tocar (MaximumLength, Flags, handles, etc.)
-#   0x60       ImagePathName  (UNICODE_STRING, 16 bytes)
-#   0x70       CommandLine    (UNICODE_STRING, 16 bytes)
-# O padding de 0x60 bytes garante que estamos no campo certo independente de
-# como o ctypes decide alinhar os campos intermediários.
+class LIST_ENTRY(ctypes.Structure):
+    pass
+LIST_ENTRY._fields_ = [
+    ("Flink", ctypes.POINTER(LIST_ENTRY)),
+    ("Blink", ctypes.POINTER(LIST_ENTRY)),
+]
+
+class LDR_DATA_TABLE_ENTRY(ctypes.Structure):
+    _fields_ = [
+        ("InLoadOrderLinks",           LIST_ENTRY),
+        ("InMemoryOrderLinks",         LIST_ENTRY),
+        ("InInitializationOrderLinks", LIST_ENTRY),
+        ("DllBase",                    ctypes.c_void_p),
+        ("EntryPoint",                 ctypes.c_void_p),
+        ("SizeOfImage",                wt.ULONG),
+        ("FullDllName",                UNICODE_STRING),
+        ("BaseDllName",                UNICODE_STRING),
+    ]
+
+class PEB_LDR_DATA(ctypes.Structure):
+    _fields_ = [
+        ("Length",                          wt.ULONG),
+        ("Initialized",                     wt.BOOLEAN),
+        ("SsHandle",                        ctypes.c_void_p),
+        ("InLoadOrderModuleList",           LIST_ENTRY),
+        ("InMemoryOrderModuleList",         LIST_ENTRY),
+        ("InInitializationOrderModuleList", LIST_ENTRY),
+    ]
+
 class RTL_USER_PROCESS_PARAMETERS(ctypes.Structure):
     _fields_ = [
-        ("_pad",          ctypes.c_byte * 0x60),  # skip até ImagePathName
+        ("_pad",          ctypes.c_byte * 0x60),
         ("ImagePathName", UNICODE_STRING),
         ("CommandLine",   UNICODE_STRING),
     ]
@@ -43,7 +62,7 @@ class PEB(ctypes.Structure):
         ("BeingDebugged",           ctypes.c_byte),
         ("Reserved2",               ctypes.c_byte * 1),
         ("Reserved3",               ctypes.c_void_p * 2),
-        ("Ldr",                     ctypes.c_void_p),
+        ("Ldr",                     ctypes.POINTER(PEB_LDR_DATA)),
         ("ProcessParameters",       ctypes.POINTER(RTL_USER_PROCESS_PARAMETERS)),
     ]
 
@@ -56,52 +75,36 @@ class PROCESS_BASIC_INFORMATION(ctypes.Structure):
         ("Reserved3",       ctypes.c_void_p),
     ]
 
-# ── helper: sobrescreve UNICODE_STRING in-place ───────────────────────────────
-
 def _patch_unicode_string(us: UNICODE_STRING, new_text: str) -> None:
-    """
-    Escreve new_text direto no buffer existente da UNICODE_STRING.
-    Se new_text for maior que MaximumLength, trunca (melhor que crash).
-    """
     encoded = (new_text + "\x00").encode("utf-16-le")
-    max_bytes = us.MaximumLength  # bytes disponíveis no buffer original
-
+    max_bytes = us.MaximumLength
     if len(encoded) > max_bytes:
-        # Trunca pra caber — sem alocação nova pra não deixar rastro no heap
         encoded = encoded[: max_bytes - 2] + b"\x00\x00"
-
-    # Buffer agora é c_void_p: o valor JÁ é o endereço inteiro, sem cast extra.
     buf_addr = us.Buffer
     if buf_addr is None:
         return
-
-    # VirtualProtect pra garantir write permission (raro, mas existe)
     old_prot = wt.DWORD(0)
-    PAGE_READWRITE = 0x04
-    kernel32.VirtualProtect(buf_addr, len(encoded), PAGE_READWRITE, ctypes.byref(old_prot))
-
+    kernel32.VirtualProtect(buf_addr, len(encoded), 0x04, ctypes.byref(old_prot))
     ctypes.memmove(buf_addr, encoded, len(encoded))
-
-    # Restaura proteção original
     kernel32.VirtualProtect(buf_addr, len(encoded), old_prot, ctypes.byref(old_prot))
+    us.Length = len(encoded) - 2
 
-    # Atualiza Length (bytes, não chars)
-    us.Length = len(encoded) - 2  # sem o null terminator
-
+def _unlink(entry: LIST_ENTRY) -> None:
+    """Remove um nó da doubly-linked list (Flink/Blink)."""
+    flink = entry.Flink
+    blink = entry.Blink
+    if flink: flink.contents.Blink = blink
+    if blink: blink.contents.Flink = flink
+    # Zera nossos próprios ponteiros para o AC não seguir de volta.
+    entry.Flink = ctypes.POINTER(LIST_ENTRY)()
+    entry.Blink = ctypes.POINTER(LIST_ENTRY)()
 
 def mask_process(fake_name: str = r"C:\Users\Public\Discord\Discord.exe",
                  fake_cmdline: str = r'"C:\Users\Public\Discord\Discord.exe"') -> bool:
-    """
-    Altera ImagePathName e CommandLine no PEB do processo atual.
-    Retorna True em sucesso.
-    """
     pbi = PROCESS_BASIC_INFORMATION()
     status = ntdll.NtQueryInformationProcess(
         kernel32.GetCurrentProcess(),
-        0,                          # ProcessBasicInformation
-        ctypes.byref(pbi),
-        ctypes.sizeof(pbi),
-        None,
+        0, ctypes.byref(pbi), ctypes.sizeof(pbi), None
     )
     if status != 0:
         return False
@@ -109,19 +112,47 @@ def mask_process(fake_name: str = r"C:\Users\Public\Discord\Discord.exe",
     peb = pbi.PebBaseAddress.contents
     params = peb.ProcessParameters.contents
 
-    # FIX-3: zera BeingDebugged.
-    # Se o processo já foi attachado por um debugger em algum momento (mesmo que
-    # já desconectado), esse byte fica 1. Qualquer anti-cheat que lê o PEB
-    # diretamente via NtQueryInformationProcess (ou até ReadProcessMemory de
-    # outro processo) detecta isso e pode banir ou encerrar a sessão.
+    # 1. Zera flags de debug
     peb.BeingDebugged = 0
 
+    # 2. Patch do ImagePathName / CommandLine
     _patch_unicode_string(params.ImagePathName, fake_name)
-    _patch_unicode_string(params.CommandLine,   fake_cmdline)
-    return True
+    _patch_unicode_string(params.CommandLine, fake_cmdline)
 
+    # 3. Deep Unlinking (LDR)
+    # Vamos deslinkar nós mesmos ("python.exe" ou "discord-helper.exe") e a dll nativa.
+    ldr = peb.Ldr.contents
+    head = ldr.InLoadOrderModuleList
+    
+    current = head.Flink
+    while current and ctypes.addressof(current.contents) != ctypes.addressof(head):
+        entry = ctypes.cast(current, ctypes.POINTER(LDR_DATA_TABLE_ENTRY)).contents
+        
+        # Lê o nome da DLL/EXE desse nó
+        name_buf = entry.BaseDllName.Buffer
+        name_len = entry.BaseDllName.Length
+        mod_name = ""
+        if name_buf and name_len > 0:
+            raw_bytes = ctypes.string_at(name_buf, name_len)
+            mod_name = raw_bytes.decode('utf-16-le', errors='ignore').lower()
+
+        # Alvos para unlinking (não pode deslinkar ntdll/kernel32 senão dá crash)
+        if "python" in mod_name or "discord" in mod_name:
+            # Unlink das 3 listas do PEB
+            _unlink(entry.InLoadOrderLinks)
+            _unlink(entry.InMemoryOrderLinks)
+            _unlink(entry.InInitializationOrderLinks)
+            
+            # Limpa as Unicode Strings para garantir
+            entry.FullDllName.Length = 0
+            entry.FullDllName.MaximumLength = 0
+            entry.BaseDllName.Length = 0
+            entry.BaseDllName.MaximumLength = 0
+
+        current = current.contents.Flink
+
+    return True
 
 if __name__ == "__main__":
     ok = mask_process()
-    print("PEB patched" if ok else "PEB patch FAILED")
-    input("enter...")
+    print("PEB Unlinked & Patched" if ok else "PEB patch FAILED")

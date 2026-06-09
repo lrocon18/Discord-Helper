@@ -1,19 +1,28 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import os
+from PyInstaller.utils.hooks import collect_all
 
 _root = os.path.abspath(os.path.join(os.path.dirname(SPEC), '..'))
 _src  = os.path.join(_root, 'src')
 
+# dxcam (captura DXGI) puxa numpy + comtypes — coleta tudo (binarios, datas, submodulos)
+_extra_datas, _extra_bins, _extra_hidden = [], [], []
+for _pkg in ('dxcam', 'numpy', 'comtypes'):
+    _d, _b, _h = collect_all(_pkg)
+    _extra_datas += _d
+    _extra_bins  += _b
+    _extra_hidden += _h
+
 a = Analysis(
     [os.path.join(_src, 'discord.py')],
     pathex=[_src],
-    binaries=[],
+    binaries=_extra_bins,
     datas=[
         (os.path.join(_src, 'peb_mask.py'),     '.'),
         (os.path.join(_src, 'arduino_wrap.py'), '.'),
         (os.path.join(_src, 'hud.py'),          '.'),
-    ],
+    ] + _extra_datas,
     hiddenimports=[
         'serial',
         'serial.tools',
@@ -22,11 +31,14 @@ a = Analysis(
         'keyboard',
         'tkinter',
         'tkinter.ttk',
-    ],
+        'dxcam',
+        'numpy',
+        'comtypes',
+    ] + _extra_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['cv2', 'PIL', 'numpy', 'mss', 'pyautogui'],
+    excludes=['cv2', 'PIL', 'mss', 'pyautogui'],
     noarchive=False,
 )
 

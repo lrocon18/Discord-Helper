@@ -190,46 +190,12 @@ peb_mask.mask_process(
 
 from arduino_wrap import ArduinoHID
 from hud import HUD
+import dxcam
+
+_camera = dxcam.create(output_color="BGRA")
 
 user32   = ctypes.WinDLL("user32")
 kernel32 = ctypes.WinDLL("kernel32")
-gdi32    = ctypes.WinDLL("gdi32")
-
-gdi32.GetPixel.restype  = ctypes.c_uint32
-gdi32.GetPixel.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
-
-user32.GetDC.restype      = ctypes.c_void_p
-user32.GetDC.argtypes     = [wt.HWND]
-user32.ReleaseDC.restype  = ctypes.c_int
-user32.ReleaseDC.argtypes = [wt.HWND, ctypes.c_void_p]
-
-gdi32.CreateCompatibleDC.restype      = ctypes.c_void_p
-gdi32.CreateCompatibleDC.argtypes     = [ctypes.c_void_p]
-gdi32.CreateCompatibleBitmap.restype  = ctypes.c_void_p
-gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
-gdi32.SelectObject.restype            = ctypes.c_void_p
-gdi32.SelectObject.argtypes           = [ctypes.c_void_p, ctypes.c_void_p]
-gdi32.BitBlt.restype                  = wt.BOOL
-gdi32.BitBlt.argtypes                 = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
-                                          ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
-                                          ctypes.c_int, ctypes.c_int, wt.DWORD]
-gdi32.GetDIBits.restype               = ctypes.c_int
-gdi32.GetDIBits.argtypes              = [ctypes.c_void_p, ctypes.c_void_p, wt.UINT, wt.UINT,
-                                          ctypes.c_void_p, ctypes.c_void_p, wt.UINT]
-gdi32.DeleteObject.restype            = wt.BOOL
-gdi32.DeleteObject.argtypes           = [ctypes.c_void_p]
-gdi32.DeleteDC.restype                = wt.BOOL
-gdi32.DeleteDC.argtypes               = [ctypes.c_void_p]
-
-class _BMIH(ctypes.Structure):
-    _fields_ = [
-        ('biSize',          wt.DWORD), ('biWidth',         wt.LONG),
-        ('biHeight',        wt.LONG),  ('biPlanes',        wt.WORD),
-        ('biBitCount',      wt.WORD),  ('biCompression',   wt.DWORD),
-        ('biSizeImage',     wt.DWORD), ('biXPelsPerMeter', wt.LONG),
-        ('biYPelsPerMeter', wt.LONG),  ('biClrUsed',       wt.DWORD),
-        ('biClrImportant',  wt.DWORD),
-    ]
 
 kernel32.GetModuleHandleW.restype  = ctypes.c_void_p
 kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
@@ -289,6 +255,10 @@ HUD_VK    = 0x4A   # J — toggle HUD visibility
 
 # CD minimo entre pots — reduzido ao minimo (quase 0). Gauss 10-20ms entre
 # disparos do mesmo slot, so pra manter um micro-jitter (evita padrao perfeito).
+<<<<<<< HEAD
+=======
+# Na pratica nao gateia: o probe roda a ~100ms/tick, entao a pot dispara a cada tick.
+>>>>>>> e3e8aa75f617b45924db021914af24f7f0bfc3fd
 _POT_CD_LO = 0.01
 _POT_CD_HI = 0.02
 
@@ -468,8 +438,8 @@ _THR_A_PCT = 40  # HP
 _THR_B_PCT = 5   # SP
 _THR_C_PCT = 5   # MP
 
-_LOCK_FILE = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), _s(_ENC_LOCK))
-
+_MUTEX_NAME = "Local\\" + _s(_ENC_LOCK)
+_APP_MUTEX = None
 @dataclass
 class State:
     active:  bool  = False
@@ -508,53 +478,23 @@ kernel32.QueryFullProcessImageNameW.argtypes = [
 
 
 def _kill_existing_instances() -> None:
-    # PID-targeted kill via lock file only — never kill by image name,
-    # senão mataríamos o cliente Discord legítimo quando o exe se chama Discord.exe.
-    _kill_by_lock_file()
-
-    try:
-        os.remove(_LOCK_FILE)
-    except Exception:
-        pass
-
+    pass
 
 def _kill_by_lock_file() -> None:
-    if not os.path.exists(_LOCK_FILE):
-        return
-    try:
-        with open(_LOCK_FILE, "r") as f:
-            pid = int(f.read().strip())
-        if pid == os.getpid():
-            return
-        h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
-        if h:
-            kernel32.TerminateProcess(h, 0)
-            kernel32.CloseHandle(h)
-    except Exception:
-        pass
-    try:
-        os.remove(_LOCK_FILE)
-    except Exception:
-        pass
-    time.sleep(0.4)
-
+    pass
 
 def _write_lock() -> None:
-    try:
-        with open(_LOCK_FILE, "w") as f:
-            f.write(str(os.getpid()))
-    except Exception:
-        pass
-
+    global _APP_MUTEX
+    _APP_MUTEX = kernel32.CreateMutexW(None, False, _MUTEX_NAME)
+    if kernel32.GetLastError() == 183: # ERROR_ALREADY_EXISTS
+        print("Bot ja em execucao. Saindo...")
+        sys.exit(0)
 
 def _remove_lock() -> None:
-    try:
-        if os.path.exists(_LOCK_FILE):
-            pid_in_file = int(open(_LOCK_FILE).read().strip())
-            if pid_in_file == os.getpid():
-                os.remove(_LOCK_FILE)
-    except Exception:
-        pass
+    global _APP_MUTEX
+    if _APP_MUTEX:
+        kernel32.CloseHandle(_APP_MUTEX)
+        _APP_MUTEX = None
 
 
 def _sleep_human(lo: float, hi: float) -> None:
@@ -761,27 +701,19 @@ def _nn_scale(src, sw: int, sh: int, sc: int, dw: int, dh: int) -> bytearray:
     return out
 
 
+def _read_px(hdc_src, x: int, y: int) -> tuple[int, int, int]:
+    frame = _camera.grab(region=(x, y, x+1, y+1))
+    if frame is None or len(frame) == 0:
+        return -1, -1, -1
+    px = frame[0][0]
+    return int(px[2]), int(px[1]), int(px[0]) # R, G, B
+
 def _capture_region(hdc_src, sx: int, sy: int, cw: int, ch: int):
-    """BitBlt (sx,sy,cw,ch) into BGRX bytearray (4 bytes/px, top-down) or None."""
-    hdc_m = gdi32.CreateCompatibleDC(hdc_src)
-    if not hdc_m:
+    """Captura BGRX usando DXGI (dxcam)."""
+    frame = _camera.grab(region=(sx, sy, sx+cw, sy+ch))
+    if frame is None or frame.size == 0:
         return None
-    bmp = gdi32.CreateCompatibleBitmap(hdc_src, cw, ch)
-    if not bmp:
-        gdi32.DeleteDC(hdc_m)
-        return None
-    old = gdi32.SelectObject(hdc_m, bmp)
-    gdi32.BitBlt(hdc_m, 0, 0, cw, ch, hdc_src, sx, sy, 0xCC0020)
-    bmi = _BMIH()
-    bmi.biSize = ctypes.sizeof(_BMIH)
-    bmi.biWidth = cw; bmi.biHeight = -ch   # negative → top-down row order
-    bmi.biPlanes = 1; bmi.biBitCount = 32; bmi.biCompression = 0
-    buf = (ctypes.c_uint8 * (cw * ch * 4))()
-    gdi32.GetDIBits(hdc_m, bmp, 0, ch, buf, ctypes.byref(bmi), 0)
-    gdi32.SelectObject(hdc_m, old)
-    gdi32.DeleteObject(bmp)
-    gdi32.DeleteDC(hdc_m)
-    return bytearray(buf)
+    return bytearray(frame.tobytes())
 
 
 
