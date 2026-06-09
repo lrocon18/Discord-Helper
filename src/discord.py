@@ -287,10 +287,11 @@ TOGGLE_VK = 0x4B   # K — toggle active
 CLOSE_VK  = 0x4C   # L — close
 HUD_VK    = 0x4A   # J — toggle HUD visibility
 
-# CD minimo entre pots — anti-fingerprint (humanos nao clicam >5x/s sustentado).
-# Gauss 150-200ms entre disparos do mesmo slot. Pots de slots diferentes nao competem.
-_POT_CD_LO = 0.15
-_POT_CD_HI = 0.20
+# CD minimo entre pots — reduzido ao minimo (quase 0). Gauss 10-20ms entre
+# disparos do mesmo slot, so pra manter um micro-jitter (evita padrao perfeito).
+# Na pratica nao gateia: o probe roda a ~100ms/tick, entao a pot dispara a cada tick.
+_POT_CD_LO = 0.01
+_POT_CD_HI = 0.02
 
 _EMPTY_ALERT_CD = 30.0  # seconds between empty-slot warnings per slot
 
