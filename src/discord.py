@@ -1402,14 +1402,10 @@ def _probe_loop() -> None:
 
             def _try_pot(key: str, pct: int, thr: int, slot_idx: int, slot_c,
                          last_pot_d, last_empty_d, label: str):
-                if _empty(_slot_empty_tmpl[slot_idx], slot_c):
-                    _log(f"[DBG] {label} {pct}% slot{slot_idx+1} EMPTY skip")
-                    if now - last_empty_d[key] > _EMPTY_ALERT_CD:
-                        last_empty_d[key] = now
-                        _emit_ping('p')
-                    return
-                # CD minimo entre pots do mesmo slot (gauss 150-200ms) —
-                # mata o pattern de 30Hz que seria fingerprint obvia.
+                # Sem gate de slot-vazio: o cache de 5s do slot-empty estava
+                # falsamente marcando o slot como vazio apos usar a pot (visual
+                # de cooldown), skipando a proxima pot por ate 5s. Agora dispara
+                # sempre que a barra cruzar o threshold.
                 dt = now - last_pot_d[key]
                 cd_lim = random.gauss((_POT_CD_LO + _POT_CD_HI) / 2,
                                       (_POT_CD_HI - _POT_CD_LO) / 4)
