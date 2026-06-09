@@ -287,10 +287,10 @@ TOGGLE_VK = 0x4B   # K — toggle active
 CLOSE_VK  = 0x4C   # L — close
 HUD_VK    = 0x4A   # J — toggle HUD visibility
 
-# CD minimo entre pots — anti-fingerprint (humanos nao clicam >5x/s sustentado).
-# Gauss 150-200ms entre disparos do mesmo slot. Pots de slots diferentes nao competem.
-_POT_CD_LO = 0.15
-_POT_CD_HI = 0.20
+# CD minimo entre pots — reduzido ao minimo (quase 0). Gauss 10-20ms entre
+# disparos do mesmo slot, so pra manter um micro-jitter (evita padrao perfeito).
+_POT_CD_LO = 0.01
+_POT_CD_HI = 0.02
 
 _EMPTY_ALERT_CD = 30.0  # seconds between empty-slot warnings per slot
 
@@ -1456,12 +1456,13 @@ def _probe_loop() -> None:
                     if _settings.soul_beep:
                         _emit_ping(kind)
 
-            # Tick rate adaptativo: rapido enquanto algum dos pcts esta baixo,
-            # devagar quando tudo OK pra economizar CPU/GDI.
+            # Tick rate adaptativo: quase 0 (5ms) enquanto algum pct esta baixo —
+            # mata o delay entre uma pot e a proxima; 50ms ocioso (detecta queda
+            # rapido) quando tudo OK, ainda economico de CPU.
             any_low = (hp_pct < _settings.pot_hp_pct or
                        sp_pct < _settings.pot_sp_pct or
                        mp_pct < _settings.pot_mp_pct)
-            time.sleep(0.03 if any_low else 0.1)
+            time.sleep(0.005 if any_low else 0.05)
 
     except Exception:
         import traceback
