@@ -253,6 +253,12 @@ TOGGLE_VK = 0x4B   # K — toggle active
 CLOSE_VK  = 0x4C   # L — close
 HUD_VK    = 0x4A   # J — toggle HUD visibility
 
+# CD minimo entre pots — reduzido ao minimo (quase 0). Gauss 10-20ms entre
+# disparos do mesmo slot, so pra manter um micro-jitter (evita padrao perfeito).
+# Na pratica nao gateia: o probe roda a ~100ms/tick, entao a pot dispara a cada tick.
+_POT_CD_LO = 0.01
+_POT_CD_HI = 0.02
+
 _EMPTY_ALERT_CD = 30.0  # seconds between empty-slot warnings per slot
 
 _AUX_CD      = 10.0   # fixed game cooldown (seconds)
@@ -1331,31 +1337,39 @@ def _probe_loop() -> None:
                         last_empty_d[key] = now
                         _emit_ping('p')
                     return
-                # Sem delay entre pots: dispara imediatamente ao cruzar o threshold.
+                # CD minimo entre pots do mesmo slot (gauss 150-200ms) —
+                # mata o pattern de 30Hz que seria fingerprint obvia.
+                dt = now - last_pot_d[key]
+                cd_lim = random.gauss((_POT_CD_LO + _POT_CD_HI) / 2,
+                                      (_POT_CD_HI - _POT_CD_LO) / 4)
+                cd_lim = max(_POT_CD_LO * 0.85, min(_POT_CD_HI * 1.15, cd_lim))
+                if dt < cd_lim:
+                    return
                 if _ic and _can_probe():
                     try:
                         _ic.send_key(key, hold_sec=random.uniform(0.03, 0.06))
                         last_pot_d[key] = time.monotonic()
                         critical = pct <= max(1, thr // 2)
                         tag = "CRIT" if critical else "FIRED"
-                        _log(f"[POT] {label} {tag} pct={pct}% thr={thr}%")
+                        _log(f"[POT] {label} {tag} pct={pct}% thr={thr}% cd={cd_lim*1000:.0f}ms")
                     except Exception as e:
                         _log(f"[ERR] {label} send_key EXC: {type(e).__name__}: {e}")
 
-            # HP dispara PRIMEIRO (prioridade), mas SP/MP nao esperam — todas
-            # as pots abaixo do threshold disparam no MESMO tick, sem delay.
+            # Prioridade absoluta: HP. Se HP baixa, NAO toca SP/MP nesse tick.
             hp_low = hp_pct < _settings.pot_hp_pct
             state.hp_critical = hp_low and hp_pct <= max(1, _settings.pot_hp_pct // 2)
 
             if hp_low:
                 _try_pot('1', hp_pct, _settings.pot_hp_pct, 0, s1_c,
                          last_pot, last_empty_alert, 'hp')
-            if sp_pct < _settings.pot_sp_pct:
-                _try_pot('2', sp_pct, _settings.pot_sp_pct, 1, s2_c,
-                         last_pot, last_empty_alert, 'sp')
-            if mp_pct < _settings.pot_mp_pct:
-                _try_pot('3', mp_pct, _settings.pot_mp_pct, 2, s3_c,
-                         last_pot, last_empty_alert, 'mp')
+            else:
+                # HP ok — pode tratar SP/MP normalmente
+                if sp_pct < _settings.pot_sp_pct:
+                    _try_pot('2', sp_pct, _settings.pot_sp_pct, 1, s2_c,
+                             last_pot, last_empty_alert, 'sp')
+                if mp_pct < _settings.pot_mp_pct:
+                    _try_pot('3', mp_pct, _settings.pot_mp_pct, 2, s3_c,
+                             last_pot, last_empty_alert, 'mp')
 
             # Soul/badge scan (independent timer)
             if now >= _next_poll:
