@@ -295,6 +295,14 @@ _POT_REACT_STD  = 0.022
 _POT_REACT_LO   = 0.028
 _POT_REACT_HI   = 0.120
 
+# Debounce por slot (gaussiano ~300ms): apos beber, espera a barra refletir a
+# cura na tela antes de poder beber o MESMO slot de novo — evita pot dupla.
+# Nao e o "delay" antigo (refresh/GetPixel): e so anti-duplo + cadencia humana.
+_POT_CD_MEAN = 0.30
+_POT_CD_STD  = 0.07
+_POT_CD_LO   = 0.20
+_POT_CD_HI   = 0.45
+
 _AUX_CD      = 10.0   # fixed game cooldown (seconds)
 _AUX_JIT_LO  = 2.0    # human jitter range after cooldown
 _AUX_JIT_HI  = 5.0
@@ -1308,6 +1316,7 @@ user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
 
 def _probe_loop() -> None:
     try:
+        last_pot          = {'1': 0.0, '2': 0.0, '3': 0.0}  # debounce por slot
         _hwnd             = None
         _dims             = None
         _bar_xs           = None
@@ -1403,17 +1412,24 @@ def _probe_loop() -> None:
                     f"s3e={_empty(_slot_empty_tmpl[2], s3_c)}"
                 )
 
-            def _try_pot(key: str, pct: int, thr: int, label: str):
+            def _try_pot(key: str, pct: int, thr: int, last_pot_d, label: str):
+                # Debounce por slot: nao re-bebe o mesmo slot ate a barra ter
+                # tempo de refletir a cura (evita pot dupla). Gauss ~300ms.
+                cd = max(_POT_CD_LO, min(_POT_CD_HI,
+                                         random.gauss(_POT_CD_MEAN, _POT_CD_STD)))
+                if time.monotonic() - last_pot_d[key] < cd:
+                    return
                 if not (_ic and _can_probe()):
                     return
                 try:
                     # micro-reacao humana gaussiana antes de apertar — quebra o
-                    # padrao de reacao instantanea/identica; tambem espaca disparos.
+                    # padrao de reacao instantanea/identica do macro.
                     react = max(_POT_REACT_LO,
                                 min(_POT_REACT_HI,
                                     random.gauss(_POT_REACT_MEAN, _POT_REACT_STD)))
                     time.sleep(react)
                     _ic.send_key(key, hold_sec=random.uniform(0.02, 0.04))
+                    last_pot_d[key] = time.monotonic()
                     critical = pct <= max(1, thr // 2)
                     tag = "CRIT" if critical else "FIRED"
                     _log(f"[POT] {label} {tag} pct={pct}% thr={thr}% react={react*1000:.0f}ms")
@@ -1427,11 +1443,11 @@ def _probe_loop() -> None:
             state.hp_critical = hp_low and hp_pct <= max(1, _settings.pot_hp_pct // 2)
 
             if hp_low:
-                _try_pot('1', hp_pct, _settings.pot_hp_pct, 'hp')
+                _try_pot('1', hp_pct, _settings.pot_hp_pct, last_pot, 'hp')
             if sp_pct < _settings.pot_sp_pct:
-                _try_pot('2', sp_pct, _settings.pot_sp_pct, 'sp')
+                _try_pot('2', sp_pct, _settings.pot_sp_pct, last_pot, 'sp')
             if mp_pct < _settings.pot_mp_pct:
-                _try_pot('3', mp_pct, _settings.pot_mp_pct, 'mp')
+                _try_pot('3', mp_pct, _settings.pot_mp_pct, last_pot, 'mp')
 
             # (scan de Soul movido pra _soul_loop, thread separada — antes ele
             #  bloqueava o pot por segundos a cada poll de 1s)
