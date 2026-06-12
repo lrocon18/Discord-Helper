@@ -1120,8 +1120,11 @@ _hud: HUD | None = None
 
 
 def _idle_tick() -> None:
+    # Autoclique nativo do jogo expira em ~15s. Mantemos o re-click bem abaixo
+    # disso (margem de seguranca) pra nao deixar o autoclique pausar — ainda mais
+    # porque o rebuff interrompe o idle_tick e reinicia a espera depois.
     RECLICK_LO = 8.0
-    RECLICK_HI = 14.8
+    RECLICK_HI = 13.0
 
     last_fatigue_time = time.time()
     fatigue_interval  = random.uniform(600, 1800)
