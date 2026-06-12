@@ -1194,10 +1194,11 @@ def _run_sync() -> None:
             _ic.send_key(key, hold_sec=random.uniform(0.08, 0.15))
             time.sleep(random.uniform(0.08, 0.15))
             _human_click(_ic, double=True, right=True)
-            time.sleep(random.uniform(0.3, 0.6))
+            # 1s entre cada skill — dá tempo do rebuff passar sem erro
+            time.sleep(random.uniform(1.0, 1.3))
 
         if not state.stop:
-            time.sleep(random.uniform(0.2, 0.4))
+            time.sleep(random.uniform(1.0, 1.3))
             _ic.send_key('f1', hold_sec=random.uniform(0.08, 0.12))
             time.sleep(random.uniform(0.15, 0.3))
             _human_click(_ic, double=True, right=True)
@@ -1412,7 +1413,12 @@ def _probe_loop() -> None:
                     f"s3e={_empty(_slot_empty_tmpl[2], s3_c)}"
                 )
 
-            def _try_pot(key: str, pct: int, thr: int, last_pot_d, label: str):
+            def _try_pot(key: str, pct: int, thr: int, slot_idx: int, slot_c,
+                         last_pot_d, label: str):
+                # Slot vazio (sem pocoes): nao tenta beber — evita apertar a
+                # tecla de um slot sem pot.
+                if _empty(_slot_empty_tmpl[slot_idx], slot_c):
+                    return
                 # Debounce por slot: nao re-bebe o mesmo slot ate a barra ter
                 # tempo de refletir a cura (evita pot dupla). Gauss ~300ms.
                 cd = max(_POT_CD_LO, min(_POT_CD_HI,
@@ -1443,11 +1449,11 @@ def _probe_loop() -> None:
             state.hp_critical = hp_low and hp_pct <= max(1, _settings.pot_hp_pct // 2)
 
             if hp_low:
-                _try_pot('1', hp_pct, _settings.pot_hp_pct, last_pot, 'hp')
+                _try_pot('1', hp_pct, _settings.pot_hp_pct, 0, s1_c, last_pot, 'hp')
             if sp_pct < _settings.pot_sp_pct:
-                _try_pot('2', sp_pct, _settings.pot_sp_pct, last_pot, 'sp')
+                _try_pot('2', sp_pct, _settings.pot_sp_pct, 1, s2_c, last_pot, 'sp')
             if mp_pct < _settings.pot_mp_pct:
-                _try_pot('3', mp_pct, _settings.pot_mp_pct, last_pot, 'mp')
+                _try_pot('3', mp_pct, _settings.pot_mp_pct, 2, s3_c, last_pot, 'mp')
 
             # (scan de Soul movido pra _soul_loop, thread separada — antes ele
             #  bloqueava o pot por segundos a cada poll de 1s)
