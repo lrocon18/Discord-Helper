@@ -322,6 +322,22 @@ class HUD:
         for fk in ("f1", "f2", "f3", "f4"):
             self._build_skill_row(frame, fk)
 
+        # Autoclick (double-click de manutencao) — ACIMA do rebuff
+        tk.Frame(frame, bg="#2a2a2a", height=1).pack(fill="x", pady=(8, 6))
+        tk.Label(frame, text="Double-click (autoclick) a cada:", bg=_BG, fg=_FG,
+                 font=("Segoe UI", 9)).pack(anchor="w")
+        ac_row = tk.Frame(frame, bg=_BG)
+        ac_row.pack(fill="x", pady=(2, 0))
+        v_ac = tk.StringVar(value=str(int(getattr(self._working, "autoclick_secs", 10))))
+        cmb_ac = ttk.Combobox(ac_row, textvariable=v_ac,
+                              values=["3", "7", "10", "12", "15"],
+                              state="readonly", width=6)
+        cmb_ac.pack(side="left")
+        tk.Label(ac_row, text="s  (+ jitter gauss 0.5-1.5s)", bg=_BG, fg=_MUTED,
+                 font=("Segoe UI", 8)).pack(side="left", padx=(6, 0))
+        cmb_ac.bind("<<ComboboxSelected>>", lambda e: self._mark_dirty())
+        self._tk_vars["autoclick_secs"] = v_ac
+
         # Rebuff + start with buff
         tk.Frame(frame, bg="#2a2a2a", height=1).pack(fill="x", pady=(8, 6))
         tk.Label(frame, text="Rebuff (minutos):", bg=_BG, fg=_FG,

@@ -55,6 +55,9 @@ class Settings:
     skill_f4_cd: float = 20.0
     rebuff_minutes:  int  = 7    # 5..10
     start_with_buff: bool = True
+    # Intervalo do double-click (autoclick p/ manter o boneco batendo).
+    # Opcoes pre-prontas: 3, 7, 10, 12, 15s. Jitter gauss 0.5-1.5s por disparo.
+    autoclick_secs: int = 10
     # POT
     pot_hp_pct: int = 40
     pot_sp_pct: int = 5
@@ -1120,12 +1123,9 @@ _hud: HUD | None = None
 
 
 def _idle_tick() -> None:
-    # Autoclique nativo do jogo expira em ~15s. Mantemos o re-click bem abaixo
-    # disso (margem de seguranca) pra nao deixar o autoclique pausar — ainda mais
-    # porque o rebuff interrompe o idle_tick e reinicia a espera depois.
-    RECLICK_LO = 8.0
-    RECLICK_HI = 13.0
-
+    # Double-click de manutencao (mantem o boneco batendo no auto do jogo).
+    # Intervalo base escolhido na HUD (3/7/10/12/15s) + jitter gaussiano 0.5-1.5s
+    # por disparo, pra nao virar um intervalo perfeito nos logs.
     last_fatigue_time = time.time()
     fatigue_interval  = random.uniform(600, 1800)
 
@@ -1143,10 +1143,9 @@ def _idle_tick() -> None:
             time.sleep(0.05)
             continue
 
-        mid   = (RECLICK_LO + RECLICK_HI) / 2
-        sigma = (RECLICK_HI - RECLICK_LO) / 4
-        wait  = random.gauss(mid, sigma)
-        wait  = max(RECLICK_LO, min(RECLICK_HI, wait))
+        base   = float(getattr(_settings, "autoclick_secs", 10))
+        jitter = max(0.5, min(1.5, random.gauss(1.0, 0.25)))
+        wait   = base + jitter
 
         deadline = time.monotonic() + wait
         interrupted = False
