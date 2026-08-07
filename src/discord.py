@@ -27,6 +27,7 @@ def _s(encoded: tuple) -> str:
 _ENC_LOCK  = (9,4,30,14,2,31,9,50,4,29,14,67,1,2,14,6)
 _ENC_LOG   = (9,4,30,14,2,31,9,67,1,2,10)
 _ENC_TITLE = (61, 31, 4, 30, 25, 2, 3, 57, 12, 1, 8, 77, 40, 56)  # "PristonTale EU"
+_ENC_TITLE_SKY = (62, 6, 20, 57, 12, 1, 8)                        # "SkyTale"
 
 if getattr(sys, 'frozen', False):
     _base_dir = os.path.dirname(sys.executable)
@@ -40,6 +41,24 @@ _CFG_DIR     = os.path.join(_base_dir, "customization")
 _STATE_FILE  = os.path.join(_CFG_DIR, "state.json")
 _RES_FILE    = os.path.join(_CFG_DIR, "resolutions.json")
 _PROFILES    = ("profile1", "profile2", "profile3")
+
+# Registro de jogos. Cada jogo tem seu titulo de janela (para _locate_window)
+# e seu proprio dir de config, de modo que perfis/state/resolucoes fiquem
+# totalmente isolados entre um Priston e outro. PT EU usa o dir "customization"
+# raiz (retrocompat); SkyTale usa "customization/skytale".
+_GAMES = {
+    "pt_eu": {
+        "label":     "Priston Tale EU",
+        "enc_title": _ENC_TITLE,
+        "cfg_sub":   "customization",
+    },
+    "skytale": {
+        "label":     "SkyTale",
+        "enc_title": _ENC_TITLE_SKY,
+        "cfg_sub":   os.path.join("customization", "skytale"),
+    },
+}
+_GAME = "pt_eu"   # jogo ativo; definido no startup via _select_game()/_apply_game()
 
 
 @dataclass
@@ -56,7 +75,7 @@ class Settings:
     rebuff_minutes:  int  = 7    # 5..10
     start_with_buff: bool = True
     # Intervalo do double-click (autoclick p/ manter o boneco batendo).
-    # Opcoes pre-prontas: 3, 7, 10, 12, 15s. Jitter gauss 0.5-1.5s por disparo.
+    # Opcoes: 1, 3, 7, 10, 12, 15s. Jitter escala com a base (micro em <=2s).
     autoclick_secs: int = 10
     # POT
     pot_hp_pct: int = 40
@@ -347,6 +366,11 @@ _RES_PROFILES: dict = {
         'PC': (0.6149, 0.9661),
     },
 }
+
+# Copia imutavel dos built-ins. Ao trocar de jogo, _apply_game reseta
+# _RES_PROFILES a partir daqui antes de sobrepor os custom do jogo escolhido,
+# evitando vazar mapeamentos de um jogo para o outro.
+_RES_BUILTINS = {k: dict(v) for k, v in _RES_PROFILES.items()}
 
 # Defaults — sobrescritos por _apply_resolution_profile assim que o probe_loop
 # detecta as dimensoes da janela.
@@ -1144,7 +1168,13 @@ def _idle_tick() -> None:
             continue
 
         base   = float(getattr(_settings, "autoclick_secs", 10))
-        jitter = max(0.5, min(1.5, random.gauss(1.0, 0.25)))
+        # Jitter escala com o intervalo: em bases curtas (opcao 1s) usa micro-
+        # variacao (~0.1-0.5s) pra ficar perto do alvo sem NUNCA cair em intervalo
+        # fixo (fingerprint do WarningAutoMouse); em bases maiores mantem 0.5-1.5s.
+        if base <= 2.0:
+            jitter = max(0.1, min(0.5, random.gauss(0.25, 0.1)))
+        else:
+            jitter = max(0.5, min(1.5, random.gauss(1.0, 0.25)))
         wait   = base + jitter
 
         deadline = time.monotonic() + wait
@@ -1299,6 +1329,10 @@ def _sig_a(c) -> bool:
 
 def _sig_b(c) -> bool:
     r, g, b = c
+    global _GAME
+    if _GAME == "skytale":
+        # SkyTale SP bar is yellow/orange
+        return (r > 100 and g > 100 and b < 100) or (g > 100 and g > r * 2.0 and g > b * 2.0)
     # bright green; multiplier 2.0 to handle near-white bar glow
     return g > 100 and g > r * 2.0 and g > b * 2.0
 
@@ -1672,10 +1706,92 @@ def _message_loop() -> None:
 
 _ctrl_handler_ref = None
 
+def _select_game() -> str | None:
+    """Tela inicial (bloqueante): escolhe qual Priston o bot vai operar.
+    Retorna o id do jogo (chave de _GAMES) ou None se o usuario fechar."""
+    import tkinter as tk
+
+    choice = {"game": None}
+    root = tk.Tk()
+    root.title("Discord Helper")
+    root.configure(bg="#1a1a1a")
+    root.resizable(False, False)
+
+    W, H = 320, 260
+    try:
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{W}x{H}+{(sw - W) // 2}+{(sh - H) // 2}")
+    except Exception:
+        root.geometry(f"{W}x{H}")
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    tk.Label(root, text="Selecione o jogo", bg="#1a1a1a", fg="#e0e0e0",
+             font=("Segoe UI", 13, "bold")).pack(pady=(26, 4))
+    tk.Label(root, text="Escolha qual Priston o bot vai operar",
+             bg="#1a1a1a", fg="#888",
+             font=("Segoe UI", 9)).pack(pady=(0, 18))
+
+    def _pick(gid):
+        choice["game"] = gid
+        root.destroy()
+
+    for gid in ("pt_eu", "skytale"):
+        g = _GAMES[gid]
+        tk.Button(root, text=g["label"], command=lambda x=gid: _pick(x),
+                  bg="#5865f2", fg="white", activebackground="#3b3f7a",
+                  activeforeground="white", relief="flat", bd=0, cursor="hand2",
+                  font=("Segoe UI", 11, "bold"), width=22, height=2).pack(pady=6)
+
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    try:
+        root.mainloop()
+    except Exception:
+        pass
+    return choice["game"]
+
+
+def _apply_game(game_id: str) -> None:
+    """Aplica o jogo escolhido: define o titulo de janela usado por
+    _locate_window e aponta a config para o dir isolado do jogo, recarregando
+    state/settings/resolucoes a partir dele."""
+    global _GAME, _TITLE_PFX, _CFG_DIR, _STATE_FILE, _RES_FILE
+    global _hud_state, _settings, _RES_PROFILES
+
+    g = _GAMES.get(game_id) or _GAMES["pt_eu"]
+    _GAME       = game_id
+    _TITLE_PFX  = _s(g["enc_title"])
+    _CFG_DIR    = os.path.join(_base_dir, g["cfg_sub"])
+    _STATE_FILE = os.path.join(_CFG_DIR, "state.json")
+    _RES_FILE   = os.path.join(_CFG_DIR, "resolutions.json")
+    try:
+        os.makedirs(_CFG_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+    # resolucoes: parte dos built-ins e sobrepoe as custom especificas do jogo
+    _RES_PROFILES = {k: dict(v) for k, v in _RES_BUILTINS.items()}
+    _load_resolutions()
+
+    # perfis/state sao carregados do dir do jogo (independentes entre jogos)
+    _hud_state = _load_hud_state()
+    _settings  = _load_profile(_hud_state.active_profile)
+    _log(f"[SVC] game={game_id} ('{g['label']}') title='{_TITLE_PFX}' cfg={_CFG_DIR}")
+
+
 def main() -> None:
     global _ic, _hud, _ctrl_handler_ref
 
     _log("[SVC] init")
+
+    _game = _select_game()
+    if _game is None:
+        _log("[SVC] selecao de jogo cancelada — encerrando")
+        return
+    _apply_game(_game)
+
     _init_templates()
     _kill_existing_instances()
     _write_lock()

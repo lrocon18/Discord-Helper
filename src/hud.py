@@ -330,10 +330,10 @@ class HUD:
         ac_row.pack(fill="x", pady=(2, 0))
         v_ac = tk.StringVar(value=str(int(getattr(self._working, "autoclick_secs", 10))))
         cmb_ac = ttk.Combobox(ac_row, textvariable=v_ac,
-                              values=["3", "7", "10", "12", "15"],
+                              values=["1", "3", "7", "10", "12", "15"],
                               state="readonly", width=6)
         cmb_ac.pack(side="left")
-        tk.Label(ac_row, text="s  (+ jitter gauss 0.5-1.5s)", bg=_BG, fg=_MUTED,
+        tk.Label(ac_row, text="s  (+ jitter gauss anti-fingerprint)", bg=_BG, fg=_MUTED,
                  font=("Segoe UI", 8)).pack(side="left", padx=(6, 0))
         cmb_ac.bind("<<ComboboxSelected>>", lambda e: self._mark_dirty())
         self._tk_vars["autoclick_secs"] = v_ac
