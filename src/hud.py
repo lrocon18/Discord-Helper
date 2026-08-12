@@ -41,7 +41,10 @@ _ALPHA    = 0.92
 _W        = 340
 _H        = 620
 
-_TABS = ("COMBATE", "POT", "DROPS", "RES")
+_TABS = ("COMBATE", "POT", "BUFF", "DROPS", "RES")
+
+_KEYS = ("f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8",
+         "f9", "f10", "f11", "f12", "1", "2", "3", "4", "5")
 
 
 class HUD:
@@ -59,6 +62,9 @@ class HUD:
         get_resolution: Callable[[], tuple] = None,
         capture_ratio: Callable[[], tuple] = None,
         save_mapping: Callable[[int, int, dict], None] = None,
+        map_inventory: bool = False,
+        buff_labels: dict = None,
+        buff_mapped: Callable[[str], bool] = None,
     ):
         self._runtime    = settings
         self._hud_state  = hud_state
@@ -72,6 +78,13 @@ class HUD:
         self._get_res     = get_resolution
         self._capture     = capture_ratio
         self._save_map    = save_mapping
+        # Wartale: mapeia tambem as 3 pocoes dentro do inventario (repot).
+        self._map_inv     = bool(map_inventory)
+        # BUFF: rotulos vem do core (dependem da classe); captura e persistencia
+        # do template do icone tambem, pra HUD nao saber de captura de tela.
+        self._buff_labels = buff_labels or {}
+        self._buff_mapped = buff_mapped
+        self._buff_lbls   = {}     # bid -> Label de status mapeado/nao
 
         # working copy
         self._working = self._load_prof(self._hud_state.active_profile)
@@ -239,6 +252,7 @@ class HUD:
         content.pack(fill="both", expand=True, padx=10, pady=(6, 0))
         self._build_combate(self._make_tab(content, "COMBATE"))
         self._build_pot(self._make_tab(content, "POT"))
+        self._build_buff(self._make_tab(content, "BUFF"))
         self._build_drops(self._make_tab(content, "DROPS"))
         self._build_res(self._make_tab(content, "RES"))
 
@@ -342,8 +356,11 @@ class HUD:
         tk.Frame(frame, bg="#2a2a2a", height=1).pack(fill="x", pady=(8, 6))
         tk.Label(frame, text="Rebuff (minutos):", bg=_BG, fg=_FG,
                  font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Label(frame, text="Buff do Wartale dura 5 min — use 4 pra recastar antes.",
+                 bg=_BG, fg=_MUTED, font=("Segoe UI", 8),
+                 wraplength=290, justify="left").pack(anchor="w")
         v_rb = tk.IntVar(value=int(self._working.rebuff_minutes))
-        tk.Scale(frame, from_=5, to=10, orient="horizontal",
+        tk.Scale(frame, from_=3, to=10, orient="horizontal",
                  variable=v_rb, bg=_BG, fg=_FG, highlightthickness=0,
                  troughcolor=_PANEL, activebackground=_ACCENT,
                  command=lambda v: self._mark_dirty()).pack(fill="x")
@@ -411,6 +428,58 @@ class HUD:
             self._tk_vars[field] = v
 
     # ── DROPS ─────────────────────────────────────────────────────────────
+    # ── BUFF ──────────────────────────────────────────────────────────────
+    def _build_buff(self, frame):
+        self._section_title(frame, "Buffs")
+        tk.Label(
+            frame,
+            text="A cada 30s o bot confere os buffs no canto superior\n"
+                 "esquerdo e recasta o que tiver caido.",
+            bg=_BG, fg=_MUTED, font=("Segoe UI", 8),
+            wraplength=290, justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        for bid, rotulo in self._buff_labels.items():
+            box = tk.Frame(frame, bg=_PANEL)
+            box.pack(fill="x", pady=3)
+
+            linha = tk.Frame(box, bg=_PANEL)
+            linha.pack(fill="x", padx=8, pady=(6, 0))
+
+            v_on = tk.BooleanVar(value=bool(getattr(self._working, f"buff_{bid}_on", False)))
+            tk.Checkbutton(
+                linha, text=rotulo, variable=v_on, bg=_PANEL, fg=_FG,
+                selectcolor=_BG, activebackground=_PANEL, activeforeground=_FG,
+                font=("Segoe UI", 9, "bold"), command=self._mark_dirty,
+            ).pack(side="left")
+            self._tk_vars[f"buff_{bid}_on"] = v_on
+
+            v_key = tk.StringVar(value=str(getattr(self._working, f"buff_{bid}_key", "f5")))
+            cmb = ttk.Combobox(linha, textvariable=v_key, values=list(_KEYS),
+                               state="readonly", width=5)
+            cmb.pack(side="right")
+            cmb.bind("<<ComboboxSelected>>", lambda e: self._mark_dirty())
+            self._tk_vars[f"buff_{bid}_key"] = v_key
+
+            rodape = tk.Frame(box, bg=_PANEL)
+            rodape.pack(fill="x", padx=8, pady=(2, 6))
+            lbl = tk.Label(rodape, text="", bg=_PANEL, font=("Segoe UI", 8))
+            lbl.pack(side="left")
+            self._buff_lbls[bid] = lbl
+
+        self._refresh_buff_status()
+
+    def _refresh_buff_status(self):
+        if self._buff_mapped is None:
+            return
+        for bid, lbl in self._buff_lbls.items():
+            try:
+                ok = self._buff_mapped(bid)
+            except Exception:
+                ok = False
+            lbl.config(text="✓ icone aprendido" if ok else "· aprende no 1o cast",
+                       fg=_SUCCESS if ok else _MUTED)
+
     def _build_drops(self, frame):
         self._section_title(frame, "Drops")
         v = tk.BooleanVar(value=self._working.soul_beep)
@@ -820,21 +889,46 @@ class _MapWizard:
     tem takefocus=0 pra nunca roubar o SPACE.
     """
 
-    _STEPS = (
-        ("Barra de VIDA — mire no TOPO da barra",     'top'),
-        ("Barra de VIDA — mire na BASE da barra",     'bot'),
-        ("Barra de STAMINA — mire no TOPO da barra",  'top'),
-        ("Barra de STAMINA — mire na BASE da barra",  'bot'),
-        ("Barra de MANA — mire no TOPO da barra",     'top'),
-        ("Barra de MANA — mire na BASE da barra",     'bot'),
-        ("Pote de VIDA — mire no CENTRO do slot",     'pt'),
-        ("Pote de STAMINA — mire no CENTRO do slot",  'pt'),
-        ("Pote de MANA — mire no CENTRO do slot",     'pt'),
+    # Cada passo carrega a TAG do que ele preenche no profile — o _finish monta
+    # o dict a partir das tags, entao adicionar/remover passo nao quebra indice.
+    #   'ZA.top'/'ZA.bot' -> barra (x, ry_topo, ry_base)
+    #   'PA'/'PB'/'PC'    -> centro do slot de pote na HUD
+    #   'RA'/'RB'/'RC'    -> pocao dentro do inventario (repot)
+    _STEPS_BARS = (
+        ("Barra de VIDA — mire no TOPO da barra",     'ZA.top'),
+        ("Barra de VIDA — mire na BASE da barra",     'ZA.bot'),
+        ("Barra de STAMINA — mire no TOPO da barra",  'ZB.top'),
+        ("Barra de STAMINA — mire na BASE da barra",  'ZB.bot'),
+        ("Barra de MANA — mire no TOPO da barra",     'ZC.top'),
+        ("Barra de MANA — mire na BASE da barra",     'ZC.bot'),
     )
+
+    _STEPS_SLOTS = (
+        ("Pote de VIDA — mire no CENTRO do slot",     'PA'),
+        ("Pote de STAMINA — mire no CENTRO do slot",  'PB'),
+        ("Pote de MANA — mire no CENTRO do slot",     'PC'),
+    )
+
+    # Passos extras (Wartale): posicao das pocoes DENTRO do inventario. Usados
+    # pelo repot — o macro leva o cursor ate esse ponto e faz SHIFT+<slot>.
+    _STEPS_INV = (
+        ("Abra o inventario (V).\nPOCAO DE VIDA — mire no CENTRO dela",     'RA'),
+        ("POCAO DE STAMINA no inventario — mire no CENTRO dela",            'RB'),
+        ("POCAO DE MANA no inventario — mire no CENTRO dela",               'RC'),
+    )
+
+    _STEPS = _STEPS_BARS + _STEPS_SLOTS
 
     def __init__(self, hud: "HUD", res: tuple):
         self._hud   = hud
         self._w, self._h = int(res[0]), int(res[1])
+        # Wartale: as barras nao sao mais mapeadas — a geometria sai dos assets
+        # do cliente (altura fixa em px + base detectada por cor), entao o
+        # wizard cai de 9 pra 6 passos: 3 slots de pote + 3 pocoes no inventario.
+        if getattr(hud, "_map_inv", False):
+            self._steps = list(self._STEPS_SLOTS) + list(self._STEPS_INV)
+        else:
+            self._steps = list(self._STEPS)
         self._step  = 0
         self._pts   = []          # lista de (rx, ry) na ordem dos steps
         self._pending = False     # setado pela thread do keyboard, lido no poll()
@@ -848,7 +942,7 @@ class _MapWizard:
         self.win.attributes("-alpha", 0.95)
         self.win.configure(bg=_BG)
         # canto superior-esquerdo — longe das barras (base) e potes (centro-baixo)
-        self.win.geometry("330x210+30+30")
+        self.win.geometry("330x235+30+30")
 
         tk.Label(self.win, bg=_ACCENT, fg="white", height=1,
                  text=f"Mapeando  {self._w}x{self._h}",
@@ -918,7 +1012,7 @@ class _MapWizard:
         self._pts.append(pt)
         self._last.config(text=f"capturado: ({pt[0]:.3f}, {pt[1]:.3f})", fg=_SUCCESS)
         self._step += 1
-        if self._step >= len(self._STEPS):
+        if self._step >= len(self._steps):
             self._finish()
         else:
             self._render()
@@ -933,22 +1027,26 @@ class _MapWizard:
         self._render()
 
     def _render(self):
-        if self._step >= len(self._STEPS):
+        if self._step >= len(self._steps):
             return
-        txt, _ = self._STEPS[self._step]
+        txt, _ = self._steps[self._step]
         self._instr.config(text=txt)
-        self._prog.config(text=f"Passo {self._step + 1} de {len(self._STEPS)}")
+        self._prog.config(text=f"Passo {self._step + 1} de {len(self._steps)}")
 
     def _finish(self):
-        p = self._pts
-        prof = {
-            'ZA': (p[0][0], p[0][1], p[1][1]),
-            'ZB': (p[2][0], p[2][1], p[3][1]),
-            'ZC': (p[4][0], p[4][1], p[5][1]),
-            'PA': (p[6][0], p[6][1]),
-            'PB': (p[7][0], p[7][1]),
-            'PC': (p[8][0], p[8][1]),
-        }
+        # Monta o profile pelas TAGS dos passos, nao por indice fixo. Chaves
+        # ausentes (ex: ZA/ZB/ZC no Wartale) sao tratadas por quem le.
+        prof = {}
+        tops = {}
+        for (_txt, tag), pt in zip(self._steps, self._pts):
+            if tag.endswith('.top'):
+                tops[tag[:2]] = pt
+            elif tag.endswith('.bot'):
+                base = tag[:2]
+                top  = tops.get(base, pt)
+                prof[base] = (top[0], top[1], pt[1])
+            else:
+                prof[tag] = (pt[0], pt[1])
         self._teardown()
         self._hud._on_mapping_done(self._w, self._h, prof)
 

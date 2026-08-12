@@ -242,12 +242,39 @@ class ArduinoHID:
             time.sleep(hold_sec)
         self._write_line(f"KU{ak:02X}")
 
+    def key_down(self, key) -> None:
+        """Segura uma tecla (sem soltar). Par obrigatorio com key_up."""
+        self._write_line(f"KD{_vk_to_ardkey(resolve_vk(key)):02X}")
+
+    def key_up(self, key) -> None:
+        self._write_line(f"KU{_vk_to_ardkey(resolve_vk(key)):02X}")
+
+    def send_combo(self, mod, key, hold_sec: float = 0.0,
+                   pre_sec: float = 0.0, post_sec: float = 0.0) -> None:
+        """Combo modificador+tecla (ex: SHIFT+1). O modificador desce, a tecla
+        e batida com hold_sec, e o modificador sobe SEMPRE (finally) — se a
+        serial falhar no meio, o SHIFT nao fica preso no SO."""
+        self.key_down(mod)
+        try:
+            if pre_sec > 0:
+                time.sleep(pre_sec)
+            self.send_key(key, hold_sec=hold_sec)
+            if post_sec > 0:
+                time.sleep(post_sec)
+        finally:
+            self.key_up(mod)
+
     # ── Mouse ────────────────────────────────────────────────────────────────
 
     def move_relative(self, dx: int, dy: int) -> None:
         # Arduino Mouse.move() aceita int8 (-127..127). Para deltas maiores,
         # quebra em vários comandos.
-        STEP = 100
+        #
+        # STEP baixo de propósito: o Windows aplica ballistics por REPORT HID e
+        # amplifica mais quanto maior o delta. Reports de 100px chegavam bem
+        # além do pedido e faziam o posicionamento absoluto oscilar. Com 40 a
+        # amplificação fica previsível — custa ~0.7ms de serial por report.
+        STEP = 40
         while dx or dy:
             sx = max(-STEP, min(STEP, dx))
             sy = max(-STEP, min(STEP, dy))

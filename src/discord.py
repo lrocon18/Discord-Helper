@@ -27,7 +27,7 @@ def _s(encoded: tuple) -> str:
 _ENC_LOCK  = (9,4,30,14,2,31,9,50,4,29,14,67,1,2,14,6)
 _ENC_LOG   = (9,4,30,14,2,31,9,67,1,2,10)
 _ENC_TITLE = (61, 31, 4, 30, 25, 2, 3, 57, 12, 1, 8, 77, 40, 56)  # "PristonTale EU"
-_ENC_TITLE_SKY = (62, 6, 20, 57, 12, 1, 8)                        # "SkyTale"
+_ENC_TITLE_WAR = (58, 12, 31, 25, 12, 1, 8)                        # "Wartale"
 
 if getattr(sys, 'frozen', False):
     _base_dir = os.path.dirname(sys.executable)
@@ -40,22 +40,23 @@ _log_path  = os.path.join(_base_dir, _s(_ENC_LOG))
 _CFG_DIR     = os.path.join(_base_dir, "customization")
 _STATE_FILE  = os.path.join(_CFG_DIR, "state.json")
 _RES_FILE    = os.path.join(_CFG_DIR, "resolutions.json")
+_BUFF_FILE   = os.path.join(_CFG_DIR, "buffs.json")
 _PROFILES    = ("profile1", "profile2", "profile3")
 
 # Registro de jogos. Cada jogo tem seu titulo de janela (para _locate_window)
 # e seu proprio dir de config, de modo que perfis/state/resolucoes fiquem
 # totalmente isolados entre um Priston e outro. PT EU usa o dir "customization"
-# raiz (retrocompat); SkyTale usa "customization/skytale".
+# raiz (retrocompat); Wartale usa "customization/wartale".
 _GAMES = {
     "pt_eu": {
         "label":     "Priston Tale EU",
         "enc_title": _ENC_TITLE,
         "cfg_sub":   "customization",
     },
-    "skytale": {
-        "label":     "SkyTale",
-        "enc_title": _ENC_TITLE_SKY,
-        "cfg_sub":   os.path.join("customization", "skytale"),
+    "wartale": {
+        "label":     "Wartale",
+        "enc_title": _ENC_TITLE_WAR,
+        "cfg_sub":   os.path.join("customization", "wartale"),
     },
 }
 _GAME = "pt_eu"   # jogo ativo; definido no startup via _select_game()/_apply_game()
@@ -81,6 +82,16 @@ class Settings:
     pot_hp_pct: int = 40
     pot_sp_pct: int = 5
     pot_mp_pct: int = 5
+    # BUFFS — por buff: ligado + tecla que recasta. O template do icone nao vem
+    # aqui: e capturado da tela pelo usuario e guardado em buffs.json.
+    buff_b1_on:  bool = False
+    buff_b1_key: str  = "f5"
+    buff_b2_on:  bool = False
+    buff_b2_key: str  = "f6"
+    buff_b3_on:  bool = False
+    buff_b3_key: str  = "f7"
+    buff_b4_on:  bool = False
+    buff_b4_key: str  = "f8"
     # DROPS
     soul_beep: bool = True
     # RESOLUCAO ("auto" = detecta a mais proxima | "WxH" = forca essa)
@@ -279,31 +290,70 @@ user32.ClipCursor.argtypes = [ctypes.POINTER(wt.RECT)]
 
 _INPUT_PAUSE   = 2.5
 _SYNC_INTERVAL = 5 * 60
-_JITTER_LO     = 1 * 60
-_JITTER_HI     = 2 * 60
+# Jitter do rebuff, PROPORCIONAL ao intervalo configurado e levemente adiantado.
+# Era aditivo de 1-2 min, o que tornava o ajuste fino impossivel: configurar 4
+# min entregava 5-6 min reais — depois do buff de 5 min ja ter caido. Agora 4
+# min entrega ~3.8-4.1, mantendo a variacao organica sem estourar a duracao.
+_JITTER_FRAC_LO = -0.06   # ate 6% mais cedo
+_JITTER_FRAC_HI =  0.03   # ate 3% mais tarde
 _SYNC_PAUSE    = 2.0
+
+# Rebuff Wartale: em vez de um double-click unico por skill, o right-click
+# pipoca durante toda a janela de cast. Taxa sorteada a cada clique (nunca
+# cadencia fixa — periodo constante e exatamente o que WarningAutoMouse pega).
+_SYNC_SPAM_HZ_LO = 5.0
+_SYNC_SPAM_HZ_HI = 8.0
 
 _REF_W = 1920   # reference resolution for template scaling
 _REF_H = 1009
 _SLOT_EMPTY_THR = 30.0  # mean per-channel SAD < threshold → slot matches empty template
 
-# === Buff verification config ===
-# Match threshold: lower = stricter pixel match required.
-_BUFF_MATCH_THR     = 28.0
-# How often the background monitor checks each buff.
-_BUFF_VERIFY_PERIOD = 25.0
-# Minimum seconds between recast attempts of the same buff.
-_BUFF_RECAST_CD     = 5.0
-# Buff profile entries — populated when user provides per-class buff icons.
-# Format: (name, recast_key, tmpl_var_name, ratio_x, ratio_y)
-#   name           — string label (used in logs only, e.g. "iron_skin")
-#   recast_key     — Interception key to send when buff is missing (e.g. "f5")
-#   tmpl_var_name  — name of the global containing the decoded template tuple
-#                    (e.g. "_g_tmpl_buff1") — must exist before _verify_buffs runs.
-#   ratio_x/y      — center of where this buff icon lands in the HUD,
-#                    as ratios of game-window dimensions (0.0-1.0).
-# Empty until templates are baked from class-specific screenshots.
-_BUFF_PROFILES: tuple = ()
+# === Verificacao de buffs ativos ===
+# Os icones ficam numa faixa no canto superior esquerdo e EMPACOTAM A ESQUERDA:
+# quando um buff cai, os da direita andam pra tras. Entao nao existe "posicao do
+# buff X" — cada template precisa ser procurado em TODOS os slots.
+#
+# Geometria medida na tela do Wartale em 1920x1009 (coords do cliente). O HUD e
+# desenhado em pixel fixo, entao esses valores nao escalam com a resolucao.
+_BUFF_X0     = 13       # x do primeiro slot
+_BUFF_Y      = 11       # topo da faixa
+_BUFF_PITCH  = 33.33    # distancia entre slots
+_BUFF_SIZE   = 31       # lado do icone
+_BUFF_SLOTS  = 10       # slots varridos
+# Raio do miolo comparado, a partir do centro do icone. Exclui a moldura e o
+# ARCO DE DURACAO que o jogo desenha girando por cima — com o arco dentro, o
+# template envelheceria sozinho.
+_BUFF_DISC_R = 10
+# SAD medio pra considerar o buff presente. Medido: mesmo buff 4s depois = 0.1,
+# buff diferente = 58 no pior caso. 25 fica no meio da lacuna.
+_BUFF_MATCH_THR     = 25.0
+_BUFF_VERIFY_PERIOD = 30.0   # varredura (pedido: 30s)
+_BUFF_RECAST_CD     = 8.0    # minimo entre recasts do mesmo buff
+_BUFF_CAST_WAIT     = 1.6    # espera apos castar, ate o icone aparecer
+
+# Aprendizado do icone por CAUSA E EFEITO: o bot aperta a tecla, olha a faixa
+# antes e depois, e o icone que APARECEU e o daquele buff. Nao depende do
+# jogador apontar nem da ordem em que ele casta — se surgiu depois do F5, e o
+# buff do F5. Um slot conta como "mudou" acima deste SAD (medido: conteudo
+# igual da 0.0-0.2, conteudo diferente da 57+).
+_BUFF_CHANGE_THR    = 30.0
+# So aceita o aprendizado se EXATAMENTE um slot mudou. Se dois mudaram (outro
+# buff caiu no mesmo instante), a associacao seria ambigua — descarta e tenta
+# no proximo ciclo. Preferir nao aprender a aprender errado.
+_BUFF_LEARN_CD      = 20.0   # entre tentativas de aprender o mesmo buff
+# Varreduras consecutivas acusando ausencia antes de recastar. Uma leitura
+# isolada pode pegar a faixa no meio de um redesenho.
+_BUFF_MISS_CONFIRM  = 2
+
+# Buffs configuraveis. id -> rotulo exibido na HUD. Comeca pela Priest; outras
+# classes entram trocando essa tabela (a captura de template e por usuario).
+_BUFF_IDS = ('b1', 'b2', 'b3', 'b4')
+_BUFF_LABELS = {
+    'b1': 'Virtual Life',
+    'b2': 'Summon Muspel',
+    'b3': 'Holy Reflection',
+    'b4': 'Divine Force',
+}
 
 TOGGLE_VK = 0x4B   # K — toggle active
 CLOSE_VK  = 0x4C   # L — close
@@ -324,6 +374,28 @@ _POT_CD_MEAN = 0.30
 _POT_CD_STD  = 0.07
 _POT_CD_LO   = 0.20
 _POT_CD_HI   = 0.45
+
+# === Repot (Wartale) ===
+# Slot vazio -> reabastece pela mochila: V (abre inventario), cursor sobre a
+# pocao mapeada (RA/RB/RC), SHIFT+<slot>, cursor de volta, V (fecha).
+_REPOT_OPEN_WAIT  = 2.0    # espera minima apos V (pedido explicito: 2s)
+_REPOT_CONFIRM    = 1.5    # segundos de slot vazio continuo antes de disparar
+_REPOT_CD         = 20.0   # cooldown base entre tentativas do mesmo slot
+_REPOT_BACKOFF    = 2.0    # multiplicador por tentativa que nao resolveu
+_REPOT_CD_MAX     = 300.0  # teto do backoff (mochila sem pocao -> para de tentar)
+_REPOT_JIT_PX     = 3      # jitter de coordenada no ponto da pocao
+_REPOT_MOVE_TOL   = 2      # px: alvo considerado atingido
+
+# Posicionamento do cursor (_move_cursor_to). O Windows amplifica o delta de
+# cada report HID conforme o tamanho dele, entao pulo longo sempre passa do
+# alvo: a aproximacao compensa pelo ganho medido e o ajuste fino trabalha
+# abaixo do joelho da curva, onde a resposta e ~1:1.
+_MOVE_COARSE_MIN  = 40     # px: acima disso ainda vale um leg de Bezier
+_MOVE_FINE_STEP   = 6      # px por report no ajuste fino
+_MOVE_FINE_MAX    = 14     # teto do passo fino quando a curva engole o delta
+_MOVE_MAX_ITERS   = 30     # iteracoes totais (aproximacao + fino)
+_MOVE_MAX_STALL   = 3      # iteracoes sem deslocamento antes de desistir
+_MOVE_ACCEPT      = 6      # px: erro final ainda aceito (slot e bem maior)
 
 _AUX_CD      = 10.0   # fixed game cooldown (seconds)
 _AUX_JIT_LO  = 2.0    # human jitter range after cooldown
@@ -380,6 +452,11 @@ _ZC_R = (0.5542, 0.8711, 0.9870)
 _PA_R = (0.5783, 0.9674)
 _PB_R = (0.5981, 0.9661)
 _PC_R = (0.6149, 0.9661)
+# Pocoes dentro do inventario (repot). None = resolucao ainda nao mapeou os
+# passos extras -> repot fica inerte.
+_RA_R: tuple | None = None
+_RB_R: tuple | None = None
+_RC_R: tuple | None = None
 _CUR_PROFILE: tuple | None = None
 
 
@@ -403,6 +480,7 @@ def _apply_resolution_profile(w: int, h: int) -> tuple | None:
     """Seleciona profile pelo settings (se forced != 'auto') ou pelo mais proximo
     de (w, h). Retorna a chave aplicada se mudou; None se nao mudou."""
     global _ZA_R, _ZB_R, _ZC_R, _PA_R, _PB_R, _PC_R, _CUR_PROFILE
+    global _RA_R, _RB_R, _RC_R
     if not _RES_PROFILES:
         return None
 
@@ -416,8 +494,13 @@ def _apply_resolution_profile(w: int, h: int) -> tuple | None:
     if target == _CUR_PROFILE:
         return None
     p = _RES_PROFILES[target]
-    _ZA_R = p['ZA']; _ZB_R = p['ZB']; _ZC_R = p['ZC']
+    # ZA/ZB/ZC (topo/base das barras) so existem em profiles do PT EU e nos
+    # antigos do Wartale — o Wartale agora deriva a geometria dos assets
+    # (_WAR_BARS) e nao mapeia mais isso. Ausentes = mantem o default.
+    _ZA_R = p.get('ZA', _ZA_R); _ZB_R = p.get('ZB', _ZB_R); _ZC_R = p.get('ZC', _ZC_R)
     _PA_R = p['PA']; _PB_R = p['PB']; _PC_R = p['PC']
+    # Opcionais — profiles antigos (mapeados antes do repot) nao tem essas chaves.
+    _RA_R = p.get('RA'); _RB_R = p.get('RB'); _RC_R = p.get('RC')
     _CUR_PROFILE = target
     return target
 
@@ -496,6 +579,68 @@ def _capture_ratio() -> tuple | None:
 
 _load_resolutions()   # funde profiles custom de resolutions.json sobre os built-ins
 
+# === Wartale: barras derivadas dos assets do cliente ===
+# image/Sinimage/Interface/Bar_{Life,Stamina,Mana}.bmp sao texturas de FILL
+# puras (sem soquete, sem alpha) — o cliente desenha a textura recortada de
+# baixo pra cima conforme a porcentagem.
+#
+# O HUD e desenhado em pixels FIXOS, NAO escala com a resolucao: o span que os
+# profiles mapeados a mao registraram pro HP ficou em 88-92px em 1024x768,
+# 1366x768 e 1920x1009 (asset = 94px). Se escalasse, 1024x768 daria 71px. Logo
+# a altura da barra e constante e nao precisa ser mapeada — basta achar a BASE
+# dela na tela, que e o unico ponto sempre visivel (a barra enche de baixo pra
+# cima, entao a base do fill == base da barra sempre que pct > 0).
+#
+# Faixas HSV medidas nos proprios assets e alargadas pra absorver blend/gamma:
+#   Life    H 179..180 (wrap no 0)  S>=83  V>=78
+#   Stamina H  30..51               S>=40  V>=86  (+20% de sheen branco)
+#   Mana    H 119..120              S>=70  V>=91
+# Validado linha a linha: 94/94, 76/76 e 94/94 linhas aprovadas.
+#
+#            (larg, alt, h_lo, h_hi, s_min, v_min)   h_lo > h_hi = wrap no 0
+# SATURACAO e o que separa barra de fundo. Medido no log de diagnostico: os
+# falsos positivos que inflavam a stamina (cinza-oliva da arte da HUD acima do
+# fill real) ficam em s=24..113, enquanto pixel de barra de verdade fica em
+# s=173..218. Piso em 130 cai no meio dessa lacuna.
+#
+# Nao da pra depender do hue na stamina: o verde-amarelo dela colide com o
+# oliva da HUD (falsos em h33..48 contra h45..48 do real). HP e MP escapam
+# disso porque vermelho puro e azul puro nao existem no resto da tela.
+#
+# O piso alto vai SO na stamina. Subir HP/MP junto quebraria a deteccao deles:
+# a coluna de brilho do asset cai fora e o grupo de 16 colunas se parte em
+# pedacos de 10, abaixo da largura minima aceita (11). Eles nao precisam —
+# nenhum falso positivo deles apareceu no log, os perfis de coluna vieram como
+# plateaus perfeitos de 16.
+#
+# Conferido contra os assets: com s>=130 a stamina mantem 4 de 8 px em TODAS as
+# 76 linhas (threshold de linha = 1) e grupo contiguo de 4 colunas (janela
+# aceita 3..14). V fica logo abaixo do minimo do asset (78/86/91).
+_WAR_BARS = {
+    'a': (16, 94, 176,   4,  60, 62),  # HP  — vermelho, hue cruza o zero
+    'b': ( 8, 76,  26,  56, 130, 68),  # SP  — verde-amarelado
+    'c': (16, 94, 112, 128,  55, 72),  # MP  — azul
+}
+# Linha conta como "cheia" se >=25% dos pixels baterem (o sheen branco vertical
+# da stamina come ate 2 dos 8 px; pior caso medido no asset foi 6/8).
+_WAR_ROW_PCT   = 4      # divisor: largura // 4 = 25%
+_WAR_BOT_SEEK  = 60     # px varridos abaixo do hint procurando a base da barra
+# Linhas contiguas exigidas pra aceitar uma base. 2, nao 3: a stamina tem so
+# 76px, entao 3% dela ja e 2 linhas — com 3 a barra mais curta era a unica que
+# nunca conseguia se localizar quando estava baixa, que e justamente quando o
+# pot precisa dela.
+_WAR_BOT_RUN   = 2
+
+# Deteccao do x da barra por altura de coluna (_war_candidates).
+_WAR_XMIN_ROWS  = 12    # linhas contiguas na vertical pra a coluna ser candidata
+_WAR_XLOCK_ROWS = 25    # confianca pra TRAVAR o x: acima disso e barra, nao ruido
+_WAR_BASE_TOL   = 4     # px de folga na baseline compartilhada pelas 3 barras
+
+# Diagnostico das barras (_war_diag). Desligar quando a leitura estiver ok —
+# custa ~30ms por emissao e enche o log.
+_WAR_DIAG        = True
+_WAR_DIAG_PERIOD = 3.0
+
 _THR_A = 0.50    # legacy ratio (used in _thresh_px for slot-empty calc)
 _THR_B = 0.10
 _THR_C = 0.10
@@ -516,6 +661,10 @@ class State:
     # Quando True: HP/SP/MP esta abaixo do threshold de pot. Threads de combate
     # (idle_tick, aux_loop) cedem espaco pra pot fire ter prioridade na serial.
     hp_critical: bool = False
+    # Quando True: ciclo de repot em andamento (inventario aberto, cursor fora
+    # de posicao, SHIFT segurado). NENHUMA outra thread pode mandar tecla ou
+    # click — um '1' solto durante o SHIFT vira SHIFT+1 e mexe item na mochila.
+    repotting: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def paused_by_user(self) -> bool:
@@ -651,12 +800,131 @@ def _human_move(ic, dx: int, dy: int, steps: int = 0, total_ms: float = 0.0) -> 
         time.sleep(jitter)
 
 
+def _cursor_pos() -> tuple[int, int] | None:
+    pt = wt.POINT()
+    if not user32.GetCursorPos(ctypes.byref(pt)):
+        return None
+    return (pt.x, pt.y)
+
+
+def _move_cursor_to(ic, tx: int, ty: int) -> bool:
+    """Leva o cursor ate (tx, ty) na tela so com deltas relativos (o HID do
+    Leonardo nao tem move absoluto).
+
+    O problema: o Windows aplica ballistics no delta de CADA report HID, e a
+    amplificacao cresce com o tamanho do delta. Um pulo longo num report so
+    chega amplificado, passa do alvo, e corrigir com outro pulo longo so faz
+    oscilar — era isso que quebrava o repot quando o mouse estava longe.
+
+    Solucao em duas fases:
+      1. APROXIMACAO (dist > _MOVE_COARSE_MIN): Bezier humano, mas com o delta
+         pedido dividido pelo ganho MEDIDO. O ganho e aprendido no proprio
+         movimento (deslocamento real / pedido) e vale pra velocidade de mouse
+         e 'Enhance pointer precision' do usuario, sejam quais forem.
+      2. AJUSTE FINO (dist <= _MOVE_COARSE_MIN): passos de poucos px, abaixo do
+         joelho da curva de aceleracao, onde a resposta e ~1:1. Se um passo nao
+         mover nada (a curva engole delta pequeno em baixa velocidade), o passo
+         cresce ate destravar.
+    """
+    if ic is None:
+        return False
+    gain_x = gain_y = 1.0
+    fine   = _MOVE_FINE_STEP
+    stalls = 0
+
+    for _ in range(_MOVE_MAX_ITERS):
+        cur = _cursor_pos()
+        if cur is None:
+            return False
+        dx = tx - cur[0]
+        dy = ty - cur[1]
+        if abs(dx) <= _REPOT_MOVE_TOL and abs(dy) <= _REPOT_MOVE_TOL:
+            return True
+
+        if max(abs(dx), abs(dy)) > _MOVE_COARSE_MIN:
+            req_x = int(dx / gain_x)
+            req_y = int(dy / gain_y)
+            _human_move(ic, req_x, req_y)
+            time.sleep(random.uniform(0.03, 0.06))
+            new = _cursor_pos()
+            if new is None:
+                return False
+            # Aprende o ganho por eixo (so quando o pedido foi grande o
+            # bastante pra medida ter sentido). EMA pra nao oscilar.
+            if abs(req_x) >= 12:
+                g = (new[0] - cur[0]) / float(req_x)
+                gain_x = max(0.35, min(5.0, 0.5 * gain_x + 0.5 * g))
+            if abs(req_y) >= 12:
+                g = (new[1] - cur[1]) / float(req_y)
+                gain_y = max(0.35, min(5.0, 0.5 * gain_y + 0.5 * g))
+            moved = abs(new[0] - cur[0]) + abs(new[1] - cur[1])
+        else:
+            sx = max(-fine, min(fine, dx))
+            sy = max(-fine, min(fine, dy))
+            ic.move_relative(sx, sy)
+            time.sleep(random.uniform(0.008, 0.018))
+            new = _cursor_pos()
+            if new is None:
+                return False
+            moved = abs(new[0] - cur[0]) + abs(new[1] - cur[1])
+            if moved == 0:
+                # Delta pequeno demais pra vencer a curva — engrossa o passo.
+                fine = min(_MOVE_FINE_MAX, fine + 2)
+            elif ((tx - new[0]) * dx < 0) or ((ty - new[1]) * dy < 0):
+                # Passou do alvo (o erro trocou de sinal): com mouse rapido o
+                # passo fino chega dobrado na tela. Encolhe pra convergir em
+                # vez de ficar pingando de um lado pro outro do alvo.
+                fine = max(1, fine // 2)
+
+        # Travou (borda da tela, cursor preso): nao insiste.
+        if moved == 0:
+            stalls += 1
+            if stalls >= _MOVE_MAX_STALL:
+                break
+        else:
+            stalls = 0
+
+    cur = _cursor_pos()
+    if cur is None:
+        return False
+    err = max(abs(tx - cur[0]), abs(ty - cur[1]))
+    if err > _MOVE_ACCEPT:
+        _log(f"[INV] move to ({tx},{ty}) parou a {err}px "
+             f"(gain={gain_x:.2f},{gain_y:.2f})")
+    # Slot de inventario e bem maior que _MOVE_ACCEPT — erro pequeno ainda acerta.
+    return err <= _MOVE_ACCEPT
+
+
 def _human_click(ic, double: bool = False, right: bool = False) -> None:
     # Click in place — no pre-click drift. Pre-delay gaussiano.
     if ic is None:
         return
     _sleep_human(0.018, 0.060)
     ic.send_mouse_click(double=double, right=right)
+
+
+def _spam_right_click(ic, duration: float) -> int:
+    """Martela right-click por `duration` segundos (Wartale rebuff).
+    Retorna quantos cliques sairam (log).
+
+    A taxa alvo e sorteada a CADA clique dentro de _SYNC_SPAM_HZ_LO..HI e o
+    tempo gasto no proprio clique (send_mouse_click ja tem tremor + delay beta
+    entre down/up) e descontado do intervalo — assim a taxa real fica na faixa
+    pedida em vez de derivar pra baixo.
+    """
+    if ic is None or duration <= 0:
+        return 0
+    deadline = time.monotonic() + duration
+    n = 0
+    while time.monotonic() < deadline and not state.stop:
+        t0 = time.monotonic()
+        ic.send_mouse_click(right=True)
+        n += 1
+        hz  = random.uniform(_SYNC_SPAM_HZ_LO, _SYNC_SPAM_HZ_HI)
+        gap = (1.0 / hz) - (time.monotonic() - t0)
+        if gap > 0:
+            time.sleep(max(0.01, random.gauss(gap, gap * 0.20)))
+    return n
 
 
 def _target_window_focused() -> bool:
@@ -668,7 +936,7 @@ def _target_window_focused() -> bool:
     buf = ctypes.create_unicode_buffer(256)
     if user32.GetWindowTextW(hwnd, buf, 256) <= 0:
         return False
-    return buf.value.startswith(_TITLE_PFX)
+    return _clean_title(buf.value).startswith(_TITLE_PFX)
 
 
 def _target_has_focus() -> bool:
@@ -689,7 +957,8 @@ def _target_has_focus() -> bool:
 
 def _can_tick() -> bool:
     return (state.active and not state.stop and not state.paused_by_user()
-            and not state.syncing and _target_has_focus())
+            and not state.syncing and not state.repotting
+            and _target_has_focus())
 
 def _can_probe() -> bool:
     return state.active and not state.stop
@@ -698,7 +967,7 @@ def _can_probe() -> bool:
 def _can_pot() -> bool:
     # Gate frouxo pra pot defensiva: não exige cursor-in-rect.
     return (state.active and not state.stop and not state.syncing
-            and _target_window_focused())
+            and not state.repotting and _target_window_focused())
 
 
 user32.EnumWindows.restype  = wt.BOOL
@@ -710,7 +979,28 @@ user32.GetForegroundWindow.argtypes = []
 user32.IsWindowVisible.restype  = wt.BOOL
 user32.IsWindowVisible.argtypes = [wt.HWND]
 
-_TITLE_PFX = _s(_ENC_TITLE)
+_TITLE_PFX = _s(_GAMES[_GAME]["enc_title"])
+
+# O cliente disfarca o titulo da janela em DUAS camadas. O titulo real e
+# ' W​artale ': espacos nas pontas E um ZERO WIDTH SPACE entre o 'W' e o resto.
+# Na tela le-se "Wartale"; qualquer startswith() ingenuo falha. E armadilha
+# deliberada contra casamento de titulo.
+#
+# Casar a string exata resolveria hoje e quebraria assim que mudassem a posicao,
+# o caractere ou a quantidade de espaco. Remover a familia inteira de invisiveis
+# e so entao aparar o branco cobre qualquer variacao — inclusive invisivel
+# ANTES do espaco, que sozinho impediria o strip. Em titulo normal e no-op.
+_INVIS_CHARS = dict.fromkeys(
+    (0x00AD,                                      # soft hyphen
+     0x180E,                                      # mongolian vowel separator
+     0x200B, 0x200C, 0x200D, 0x200E, 0x200F,      # zero width space/nj/j, LRM, RLM
+     0x2060, 0x2061, 0x2062, 0x2063, 0x2064,      # word joiner + invisible ops
+     0xFEFF),                                     # zero width no-break space
+    None)
+
+
+def _clean_title(s: str) -> str:
+    return s.translate(_INVIS_CHARS).strip()
 
 def _locate_window() -> int | None:
     found = ctypes.c_void_p(0)
@@ -719,7 +1009,7 @@ def _locate_window() -> int | None:
     @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
     def _cb(hwnd, _):
         if user32.IsWindowVisible(hwnd) and user32.GetWindowTextW(hwnd, buf, 256) > 0:
-            if buf.value.startswith(_TITLE_PFX):
+            if _clean_title(buf.value).startswith(_TITLE_PFX):
                 found.value = hwnd
                 return False
         return True
@@ -760,6 +1050,7 @@ def _scan_hud(hdc_src, w: int, h: int, ox: int, oy: int) -> tuple[int, int, int]
     rows = [oy + int(ry * h) for ry in (0.9875, 0.9885, 0.9895)]
     y0 = min(rows)
     band_h = max(rows) - y0 + 1
+    # Wartale nao passa por aqui — usa _war_scan_bars (coluna alta + baseline).
     cap = _capture_region(hdc_src, ox + x_lo, y0, bw, band_h) if bw > 0 else None
     if cap is not None:
         for ry_abs in rows:
@@ -851,39 +1142,168 @@ def _sad_center(cap_bgrx, cw: int, ch: int,
     return total / (n * 3)
 
 
-def _check_buff_present(hdc_src, ratio_x: float, ratio_y: float, tmpl,
-                        w: int, h: int, ox: int, oy: int) -> tuple:
-    # Single buff icon verification via SAD template match.
-    # Returns (active: bool, avg_sad: float).
-    # Same machinery as slot-empty detection — scales template to current
-    # viewport, captures region around expected position, compares.
-    if tmpl is None:
-        return False, 999.0
-    pix, tw, th, tc = tmpl
-    sx_sc = w / _REF_W
-    sy_sc = h / _REF_H
-    cw = max(8, int(tw * sx_sc))
-    ch = max(8, int(th * sy_sc))
-    cx = ox + int(ratio_x * w)
-    cy = oy + int(ratio_y * h)
-    cap = _capture_region(hdc_src, cx - cw // 2, cy - ch // 2, cw, ch)
+# Celulas do miolo do icone, relativas ao canto do slot. Calculado uma vez.
+_BUFF_CELLS = tuple(
+    (x, y)
+    for y in range(_BUFF_SIZE) for x in range(_BUFF_SIZE)
+    if (x - _BUFF_SIZE / 2.0) ** 2 + (y - _BUFF_SIZE / 2.0) ** 2 <= _BUFF_DISC_R ** 2
+)
+
+# id -> lista RGB do miolo (template capturado pelo usuario). Vazio ate mapear.
+_g_buffs: dict = {}
+
+
+def _buff_slot_x(i: int) -> int:
+    return _BUFF_X0 + int(round(i * _BUFF_PITCH))
+
+
+def _buff_read(cap, cap_w: int, sx: int, sy: int) -> list | None:
+    """Vetor RGB do miolo de um icone dentro de `cap`, ou None se sair da area."""
+    out = []
+    for (dx, dy) in _BUFF_CELLS:
+        x = sx + dx; y = sy + dy
+        o = (y * cap_w + x) * 4
+        if o < 0 or o + 3 > len(cap):
+            return None
+        out.append(cap[o+2]); out.append(cap[o+1]); out.append(cap[o])
+    return out
+
+
+def _buff_sad(a: list, b: list) -> float:
+    if not a or not b or len(a) != len(b):
+        return 999.0
+    return sum(abs(p - q) for p, q in zip(a, b)) / len(a)
+
+
+def _buff_strip(hdc_src, ox: int, oy: int):
+    """Captura a faixa inteira de buffs de uma vez (1 BitBlt)."""
+    w = _buff_slot_x(_BUFF_SLOTS - 1) + _BUFF_SIZE + 2
+    return _capture_region(hdc_src, ox + _BUFF_X0, oy + _BUFF_Y, w, _BUFF_SIZE), w
+
+
+def _buff_present(cap, cap_w: int, tmpl: list) -> tuple:
+    """Procura o template em TODOS os slots (os icones andam quando um cai).
+    Retorna (achou, melhor_sad, slot)."""
+    best = (999.0, -1)
+    for i in range(_BUFF_SLOTS):
+        v = _buff_read(cap, cap_w, _buff_slot_x(i) - _BUFF_X0, 0)
+        if v is None:
+            break
+        s = _buff_sad(tmpl, v)
+        if s < best[0]:
+            best = (s, i)
+    return (best[0] < _BUFF_MATCH_THR, best[0], best[1])
+
+
+def _buff_back_to_main() -> None:
+    """Volta pra skill principal (F1) depois de castar um buff.
+
+    Castar troca a skill selecionada; sem isso o personagem fica com o buff na
+    mao e o autoclick passa a repetir a skill errada. O _run_sync e o _aux_loop
+    ja faziam esse retorno — o monitor de buff precisa fazer igual.
+    """
+    if not (_ic and getattr(_settings, "skill_f1", True)):
+        return
+    time.sleep(random.uniform(0.10, 0.20))
+    _ic.send_key('f1', hold_sec=_human_hold())
+
+
+def _buff_snapshot(ox: int, oy: int) -> list | None:
+    """Vetor do miolo de cada slot da faixa, num instante."""
+    hdc = user32.GetDC(None)
+    try:
+        cap, cap_w = _buff_strip(hdc, ox, oy)
+    finally:
+        user32.ReleaseDC(None, hdc)
     if cap is None:
-        return False, 999.0
-    pix_s = _nn_scale(pix, tw, th, tc, cw, ch)
-    avg   = _sad_center(cap, cw, ch, pix_s, tc)
-    return avg < _BUFF_MATCH_THR, avg
+        return None
+    out = []
+    for i in range(_BUFF_SLOTS):
+        v = _buff_read(cap, cap_w, _buff_slot_x(i) - _BUFF_X0, 0)
+        if v is None:
+            break
+        out.append(v)
+    return out or None
 
 
-def _verify_buffs(hdc_src, w: int, h: int, ox: int, oy: int) -> dict:
-    # Iterates _BUFF_PROFILES, returns {name: (active, sad)}.
-    # No-op if profiles list is empty (initial framework state).
-    result = {}
-    for entry in _BUFF_PROFILES:
-        name, _key, tmpl_var, rx, ry = entry
-        tmpl = globals().get(tmpl_var)
-        active, sad = _check_buff_present(hdc_src, rx, ry, tmpl, w, h, ox, oy)
-        result[name] = (active, sad)
-    return result
+def _buff_learn(bid: str, key: str, ox: int, oy: int) -> bool:
+    """Aprende o icone de um buff CASTANDO ele e vendo o que apareceu.
+
+    E a unica forma de associar icone a tecla sem depender do jogador: o
+    vinculo e causal. Apertou a tecla X, surgiu um icone -> aquele icone e o
+    buff da tecla X. Nao importa a ordem em que ele casta as coisas nem onde o
+    icone cai na faixa.
+
+    Aceita o resultado so quando EXATAMENTE um slot mudou. Se dois mudaram
+    (outro buff expirou no mesmo instante) a associacao seria ambigua, e um
+    template errado envenena a deteccao pra sempre — melhor nao aprender e
+    tentar de novo no proximo ciclo.
+    """
+    antes = _buff_snapshot(ox, oy)
+    if antes is None or not (_ic and _can_tick()):
+        return False
+    _ic.send_key(key, hold_sec=_human_hold())
+    time.sleep(random.uniform(0.12, 0.22))
+    _human_click(_ic, double=False, right=True)
+    time.sleep(max(_BUFF_CAST_WAIT, random.gauss(_BUFF_CAST_WAIT, 0.2)))
+    depois = _buff_snapshot(ox, oy)
+    # Volta pro F1 SEMPRE, mesmo se a leitura falhar — o personagem nao pode
+    # ficar com o buff na mao.
+    _buff_back_to_main()
+    if depois is None:
+        return False
+
+    n = min(len(antes), len(depois))
+    mudou = [i for i in range(n) if _buff_sad(antes[i], depois[i]) > _BUFF_CHANGE_THR]
+    rot = _BUFF_LABELS.get(bid, bid)
+    if len(mudou) != 1:
+        _log(f"[BUF] {rot}: aprendizado inconclusivo ({len(mudou)} slots mudaram) "
+             f"— ja estava ativo ou outro buff caiu junto")
+        return False
+
+    idx = mudou[0]
+    _save_buff(bid, bytes(bytearray(depois[idx])).hex())
+    _log(f"[BUF] {rot}: icone aprendido no slot {idx} apos {key}")
+    return True
+
+
+def _load_buffs() -> None:
+    global _g_buffs
+    _g_buffs = {}
+    try:
+        with open(_BUFF_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return
+    for k, hx in d.items():
+        try:
+            v = list(bytes.fromhex(hx))
+            if len(v) == len(_BUFF_CELLS) * 3:
+                _g_buffs[k] = v
+        except Exception:
+            continue
+
+
+def _save_buff(bid: str, hx: str) -> None:
+    try:
+        os.makedirs(_CFG_DIR, exist_ok=True)
+        d = {}
+        try:
+            with open(_BUFF_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            pass
+        d[bid] = hx
+        with open(_BUFF_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+        _g_buffs[bid] = list(bytes.fromhex(hx))
+        _log(f"[BUF] template salvo: {bid}")
+    except Exception as e:
+        _log(f"[ERR] salvar buff {bid}: {e}")
+
+
+def _buff_mapped(bid: str) -> bool:
+    return bid in _g_buffs
 
 
 def _bar_pct(hdc_src, bar_x: int, bar_r: tuple, h: int, oy: int,
@@ -904,6 +1324,8 @@ def _bar_pct(hdc_src, bar_x: int, bar_r: tuple, h: int, oy: int,
     cap = _capture_region(hdc_src, bar_x + 1, y_top, bar_w, bar_h)
     if cap is None:
         return 0
+
+    # PT EU: pixel counting sobre a faixa mapeada (ratio topo/base).
     matched = 0
     total   = bar_w * bar_h
     # BGRX: cap[i]=B, cap[i+1]=G, cap[i+2]=R
@@ -912,6 +1334,233 @@ def _bar_pct(hdc_src, bar_x: int, bar_r: tuple, h: int, oy: int,
         if sig_fn((r, g, b)):
             matched += 1
     return (matched * 100) // total
+
+
+def _war_px(spec: tuple, r: int, g: int, b: int) -> bool:
+    """Pixel bate com a cor de fill da barra? Fonte unica de verdade — usada
+    tanto pelo scan de x (_scan_hud) quanto pela contagem de linhas.
+    Integer-only (portavel pro MCU)."""
+    _bw, _bh, h_lo, h_hi, s_min, v_min = spec
+    hh, ss, vv = _pixel_to_color_space(r, g, b)
+    if vv < v_min or ss < s_min:
+        return False
+    return (h_lo <= hh <= h_hi) if h_lo <= h_hi else (hh >= h_lo or hh <= h_hi)
+
+
+def _war_hits(cap, off: int, bw: int, spec: tuple) -> int:
+    """Quantos pixels da linha batem com a cor de fill. cap = BGRX, off = byte
+    inicial da linha."""
+    n = 0
+    for x in range(bw):
+        o = off + x * 4
+        if _war_px(spec, cap[o+2], cap[o+1], cap[o]):
+            n += 1
+    return n
+
+
+def _war_candidates(cap, bw: int, band_h: int, x_lo_abs: int,
+                    spec: tuple) -> list:
+    """Grupos de colunas com cara de barra na faixa varrida.
+
+    Run horizontal nao distingue nada: icone de pocao no slot e decoracao da
+    HUD tem a mesma cor da barra e a mesma largura — foi isso que fez o x da
+    stamina pular entre 863, 1012, 1045 e 1182 no log (o real e ~866). A
+    stamina sofre mais que HP/MP porque verde-amarelo e comum na HUD, enquanto
+    vermelho puro e azul puro sao raros.
+
+    Aqui a barra e caracterizada por COLUNA ALTA e contigua. Cada candidato sai
+    como (x, confianca, ultima_linha, largura); a ultima_linha e o que permite
+    exigir baseline comum depois.
+    """
+    want = spec[0]
+    vrun  = [0] * bw          # maior run vertical da coluna
+    vlast = [-1] * bw         # linha mais baixa que bateu na coluna
+    for x in range(bw):
+        best_v = cur = 0
+        last = -1
+        for row in range(band_h):
+            o = row * bw * 4 + x * 4
+            if _war_px(spec, cap[o+2], cap[o+1], cap[o]):
+                cur += 1
+                last = row
+                if cur > best_v:
+                    best_v = cur
+            else:
+                cur = 0
+        vrun[x]  = best_v
+        vlast[x] = last
+
+    out = []
+    x = 0
+    while x < bw:
+        if vrun[x] < _WAR_XMIN_ROWS:
+            x += 1
+            continue
+        start = x
+        while x < bw and vrun[x] >= _WAR_XMIN_ROWS:
+            x += 1
+        width = x - start
+        if want - 5 <= width <= want + 6:
+            out.append((x_lo_abs + start, min(vrun[start:x]),
+                        max(vlast[start:x]), width))
+    return out
+
+
+def _war_scan_bars(hdc_src, w: int, h: int, ox: int, oy: int) -> tuple:
+    """x de cada barra (a, b, c) ou None se nao localizada.
+
+    Varre uma FAIXA ALTA (ultimos ~5% da janela) em vez das 3 linhas fixas que
+    o PT EU usa. Motivo: a barra enche de baixo pra cima, entao com stamina em
+    3% so as ultimas linhas tem cor — a faixa fina passava por cima, o x se
+    perdia e caia no fallback por ratio (errado). Barra baixa e exatamente
+    quando precisamos da leitura.
+    """
+    x_lo = int(w * 0.38)
+    bwid = int(w * 0.62) - x_lo
+    y0   = oy + int(h * 0.95)
+    band = (oy + h - 1) - y0 + 1
+    if bwid <= 0 or band <= 0:
+        return (None, None, None)
+    cap = _capture_region(hdc_src, ox + x_lo, y0, bwid, band)
+    if cap is None:
+        return (None, None, None)
+
+    cands = {c: _war_candidates(cap, bwid, band, ox + x_lo, _WAR_BARS[c])
+             for c in 'abc'}
+
+    # BASELINE COMUM: as tres barras terminam na mesma linha (nos profiles
+    # mapeados a mao a diferenca entre ZA, ZB e ZC fica em ~1px). Ruido nao
+    # respeita isso — no log os candidatos falsos de stamina terminavam em
+    # 986/994/999 enquanto as barras de verdade terminavam em 1025. Entao os
+    # candidatos fortes (coluna alta) definem a baseline e quem nao encostar
+    # nela e descartado.
+    strong = [t[2] for lst in cands.values() for t in lst
+              if t[1] >= _WAR_XLOCK_ROWS]
+    base = sorted(strong)[len(strong) // 2] if strong else None
+
+    out = []
+    for c in 'abc':
+        lst = cands[c]
+        if base is not None:
+            lst = [t for t in lst if abs(t[2] - base) <= _WAR_BASE_TOL]
+        if not lst:
+            out.append(None)
+            continue
+        want = _WAR_BARS[c][0]
+        # entre os que sobraram, o de coluna mais alta; empate vai pra largura
+        # mais proxima da largura do asset.
+        b = max(lst, key=lambda t: (t[1], -abs(t[3] - want)))
+        out.append((b[0], b[1], b[3]))     # (x, confianca, largura)
+    return tuple(out)
+
+
+def _war_find_bottom(hdc_src, bar_x: int, bar_w: int, y_hint: int, y_max: int,
+                     spec: tuple) -> int | None:
+    """Acha a BASE da barra varrendo pra baixo a partir de y_hint (a linha onde
+    _scan_hud pegou a cor). A barra enche de baixo pra cima, entao a ultima
+    linha com fill E a base — vale pra qualquer porcentagem acima de ~1%.
+
+    y_max = ultima linha da area do JOGO. Sem esse limite a varredura passava
+    do fim da janela e latchava em pixel de taskbar/desktop (no log: base de HP
+    em 1061 com a janela terminando em 1032).
+
+    Exige _WAR_BOT_RUN linhas contiguas pra aceitar — linha solta da cor certa
+    nao define base.
+    """
+    seek = min(_WAR_BOT_SEEK, y_max - y_hint + 1)
+    if seek <= 0:
+        return None
+    # bar_x/bar_w vem do detector de coluna: sao exatamente as colunas que
+    # batem na cor, entao nao ha borda com anti-alias pra descontar.
+    bw = max(1, bar_w)
+    cap = _capture_region(hdc_src, bar_x, y_hint, bw, seek)
+    if cap is None:
+        return None
+    thr = max(1, bw // _WAR_ROW_PCT)
+    filled = [_war_hits(cap, row * bw * 4, bw, spec) >= thr for row in range(seek)]
+    for row in range(seek - 1, -1, -1):
+        if not filled[row]:
+            continue
+        run = 0
+        while row - run >= 0 and filled[row - run]:
+            run += 1
+            if run >= _WAR_BOT_RUN:
+                return y_hint + row
+    return None
+
+
+def _war_bar_pct(hdc_src, bar_x: int, bar_w: int, bottom_y: int,
+                 spec: tuple) -> int:
+    """Porcentagem da barra pela geometria do asset: a altura e constante
+    (_WAR_BARS), a base vem de _war_find_bottom. Conta LINHAS cheias, nao
+    pixels — o sheen branco vertical nao distorce o resultado."""
+    bh = spec[1]
+    bw = max(1, bar_w)
+    top = bottom_y - bh + 1
+    cap = _capture_region(hdc_src, bar_x, top, bw, bh)
+    if cap is None:
+        return 0
+    thr = max(1, bw // _WAR_ROW_PCT)
+    filled = 0
+    for row in range(bh):
+        if _war_hits(cap, row * bw * 4, bw, spec) >= thr:
+            filled += 1
+    return (filled * 100) // bh
+
+
+def _war_diag(hdc_src, code: str, bar_x: int, bar_w: int, bottom_y: int) -> None:
+    """Diagnostico de uma barra. Responde uma pergunta so: quando a barra na
+    TELA esta baixa, o macro esta vendo baixo?
+
+    Emite tres coisas:
+      map   — linha a linha, '#' = o macro considera cheia, '.' = vazia, do
+              topo pra base. Se aparecer '#' onde a tela mostra vazio, a cor do
+              soquete esta passando no predicado e a leitura tem piso.
+      cols  — quantas linhas batem em CADA coluna, incluindo 6 vizinhas de cada
+              lado. Mostra a largura real da barra e se o x esta descentrado.
+      amostras — RGB + H/S/V em cinco alturas, com + / - indicando se aquele
+              pixel passou. E onde se le direto a cor do vazio.
+    """
+    spec = _WAR_BARS[code]
+    bh   = spec[1]
+    top  = bottom_y - bh + 1
+    pad  = 6
+    cw   = bar_w + pad * 2
+    cap  = _capture_region(hdc_src, bar_x - pad, top, cw, bh)
+    if cap is None:
+        _log(f"[SPD] {code} captura falhou x={bar_x} w={bar_w} bot={bottom_y}")
+        return
+
+    thr = max(1, bar_w // _WAR_ROW_PCT)
+    mp  = []
+    for row in range(bh):
+        hits = _war_hits(cap, row * cw * 4 + pad * 4, bar_w, spec)
+        mp.append('#' if hits >= thr else '.')
+
+    cols = []
+    for x in range(cw):
+        n = 0
+        for row in range(bh):
+            o = row * cw * 4 + x * 4
+            if _war_px(spec, cap[o+2], cap[o+1], cap[o]):
+                n += 1
+        cols.append(n)
+
+    cx = pad + bar_w // 2
+    smp = []
+    for frac in (0.0, 0.25, 0.5, 0.75, 0.98):
+        row = min(bh - 1, int(frac * (bh - 1)))
+        o = row * cw * 4 + cx * 4
+        r, g, b = cap[o+2], cap[o+1], cap[o]
+        hh, ss, vv = _pixel_to_color_space(r, g, b)
+        smp.append(f"y{int(frac*100):02d}={r},{g},{b}/h{hh}s{ss}v{vv}"
+                   f"{'+' if _war_px(spec, r, g, b) else '-'}")
+
+    _log(f"[SPD] {code} x={bar_x} w={bar_w} bot={bottom_y} alt={bh} "
+         f"pct={(mp.count('#') * 100) // bh}% thr_linha={thr}")
+    _log(f"[SPD] {code} map={''.join(mp)}")
+    _log(f"[SPD] {code} cols={cols}")
+    _log(f"[SPD] {code} px {' '.join(smp)}")
 
 
 def _pixel_to_color_space(r: int, g: int, b: int) -> tuple:
@@ -1211,107 +1860,142 @@ def _run_sync() -> None:
         _log("[SYNC] driver unavailable")
         return
 
+    # Repot em andamento (inventario aberto / SHIFT segurado): espera terminar
+    # antes de tomar a serial. Teto de 20s pra nunca travar o rebuff.
+    _wait_deadline = time.monotonic() + 20.0
+    while state.repotting and not state.stop and time.monotonic() < _wait_deadline:
+        time.sleep(0.1)
+
     state.syncing = True
     _log("[SYNC] start")
+    # Wartale: cada skill do rebuff so entra com o right-click martelando a
+    # janela de cast inteira. PT EU segue no double-click unico + espera.
+    _war = _GAME == "wartale"
+
+    def _cast_window(secs: float) -> None:
+        """Consome `secs` segundos confirmando o cast: spam no Wartale,
+        double-click + espera no PT EU. O tempo total gasto e o mesmo nos
+        dois caminhos — a cadencia do rebuff nao muda."""
+        if _war:
+            n = _spam_right_click(_ic, secs)
+            _log(f"[SYNC] cast window {secs:.2f}s — {n} rclicks")
+        else:
+            _human_click(_ic, double=True, right=True)
+            time.sleep(secs)
+
     try:
         _ic.send_key('f5', hold_sec=random.uniform(0.08, 0.15))
         time.sleep(random.uniform(0.08, 0.15))
-        _human_click(_ic, double=True, right=True)
-
-        time.sleep(random.gauss(_SYNC_PAUSE, 0.15))
+        _cast_window(max(0.6, random.gauss(_SYNC_PAUSE, 0.15)))
 
         for key in ('f6', 'f7', 'f8'):
             if state.stop:
                 break
             _ic.send_key(key, hold_sec=random.uniform(0.08, 0.15))
             time.sleep(random.uniform(0.08, 0.15))
-            _human_click(_ic, double=True, right=True)
             # 1s entre cada skill — dá tempo do rebuff passar sem erro
-            time.sleep(random.uniform(1.0, 1.3))
+            _cast_window(random.uniform(1.0, 1.3))
 
         if not state.stop:
             time.sleep(random.uniform(1.0, 1.3))
             _ic.send_key('f1', hold_sec=random.uniform(0.08, 0.12))
             time.sleep(random.uniform(0.15, 0.3))
-            _human_click(_ic, double=True, right=True)
+            _cast_window(random.uniform(0.45, 0.80) if _war else 0.0)
 
-        # Post-sync verification: confirm buffs landed. Logs status only;
-        # no auto-recast here (the dedicated monitor handles drift).
-        if not state.stop and _BUFF_PROFILES:
-            time.sleep(random.uniform(0.4, 0.8))
-            _post_sync_verify()
 
     finally:
         state.syncing = False
         _log("[SYNC] done")
 
 
-def _post_sync_verify() -> None:
-    # Snapshot of buff status right after _run_sync.
-    try:
-        hwnd = _locate_window()
-        dims = _query_viewport(hwnd) if hwnd else None
-        if dims is None:
-            return
-        w, h, ox, oy = dims
-        hdc = user32.GetDC(None)
-        try:
-            res = _verify_buffs(hdc, w, h, ox, oy)
-        finally:
-            user32.ReleaseDC(None, hdc)
-        if res:
-            parts = [f"{n}={'Y' if a else 'N'}({s:.0f})" for n, (a, s) in res.items()]
-            _log(f"[SYNC] verify: {' '.join(parts)}")
-    except Exception:
-        pass
-
-
 def _buff_monitor() -> None:
-    # Periodic background check. If any configured buff is missing AND the
-    # macro is in active/ready state, send the recast key for that single
-    # buff (vs full sync). Skips during state.syncing to avoid stomping.
-    if not _BUFF_PROFILES:
-        # Framework only — exit if no profiles configured.
-        _log("[BUF] monitor idle (no profiles)")
-        return
-    last_recast = {entry[0]: 0.0 for entry in _BUFF_PROFILES}
+    """A cada _BUFF_VERIFY_PERIOD confere os buffs e recasta o que faltar.
+
+    Duas fases:
+      1. APRENDER — buff habilitado sem template ainda: casta pra descobrir
+         qual e o icone dele (ver _buff_learn). Enquanto nao aprender, o
+         rebuff por tempo do _sync_scheduler continua cobrindo.
+      2. VERIFICAR — procura cada template em TODOS os slots, porque os icones
+         empacotam a esquerda e trocam de posicao quando um buff cai.
+
+    Antes de recastar exige _BUFF_MISS_CONFIRM varreduras seguidas acusando
+    ausencia: uma leitura isolada pode pegar a faixa no meio de um redesenho, e
+    recastar a toa gasta mana e mexe no ritmo do personagem.
+    """
+    last_recast = {b: 0.0 for b in _BUFF_IDS}
+    last_learn  = {b: 0.0 for b in _BUFF_IDS}
+    faltas      = {b: 0   for b in _BUFF_IDS}
+    _log("[BUF] monitor on")
+
     while not state.stop:
-        if state.syncing or not state.ready or not state.active:
-            time.sleep(1.0)
-            continue
-        # Cycle through verify period
         deadline = time.monotonic() + _BUFF_VERIFY_PERIOD
         while time.monotonic() < deadline and not state.stop:
             time.sleep(0.5)
         if state.stop:
             break
-        if state.syncing or not state.ready or not state.active:
+
+        if state.syncing or state.repotting or not state.ready or not state.active:
             continue
+
+        ligados = [b for b in _BUFF_IDS if getattr(_settings, f"buff_{b}_on", False)]
+        if not ligados:
+            continue
+
         try:
             hwnd = _locate_window()
             dims = _query_viewport(hwnd) if hwnd else None
             if dims is None:
                 continue
             w, h, ox, oy = dims
+
+            # fase 1 — aprende um por ciclo (cada tentativa casta de verdade)
+            now = time.monotonic()
+            for b in ligados:
+                if _buff_mapped(b) or now - last_learn[b] < _BUFF_LEARN_CD:
+                    continue
+                if not _can_tick():
+                    break
+                last_learn[b] = now
+                _buff_learn(b, getattr(_settings, f"buff_{b}_key", "f5"), ox, oy)
+                break
+
+            # fase 2 — verifica os que ja tem template
+            prontos = [b for b in ligados if _buff_mapped(b)]
+            if not prontos:
+                continue
             hdc = user32.GetDC(None)
             try:
-                res = _verify_buffs(hdc, w, h, ox, oy)
+                cap, cap_w = _buff_strip(hdc, ox, oy)
             finally:
                 user32.ReleaseDC(None, hdc)
+            if cap is None:
+                continue
+
+            estado = []
+            for b in prontos:
+                ok, sad, slot = _buff_present(cap, cap_w, _g_buffs[b])
+                faltas[b] = 0 if ok else faltas[b] + 1
+                estado.append(f"{b}={'Y' if ok else 'N'}({sad:.0f}@{slot})")
+            _log(f"[BUF] scan {' '.join(estado)}")
+
             now = time.monotonic()
-            for entry in _BUFF_PROFILES:
-                name, key, _tmpl_var, _rx, _ry = entry
-                active, sad = res.get(name, (False, 999.0))
-                if not active and (now - last_recast.get(name, 0.0)) > _BUFF_RECAST_CD:
-                    if _ic and _can_tick():
-                        _log(f"[BUF] {name} missing (sad={sad:.0f}) — recast {key}")
-                        _ic.send_key(key, hold_sec=random.uniform(0.08, 0.15))
-                        time.sleep(random.uniform(0.12, 0.22))
-                        _human_click(_ic, double=False, right=True)
-                        last_recast[name] = time.monotonic()
-                        time.sleep(random.uniform(0.4, 0.8))
-        except Exception:
-            pass
+            for b in prontos:
+                if faltas[b] < _BUFF_MISS_CONFIRM:
+                    continue
+                if now - last_recast[b] < _BUFF_RECAST_CD or not (_ic and _can_tick()):
+                    continue
+                key = getattr(_settings, f"buff_{b}_key", "f5")
+                _log(f"[BUF] {_BUFF_LABELS.get(b, b)} ausente "
+                     f"({faltas[b]} varreduras) — recast {key}")
+                _ic.send_key(key, hold_sec=_human_hold())
+                time.sleep(random.uniform(0.12, 0.22))
+                _human_click(_ic, double=False, right=True)
+                last_recast[b] = time.monotonic()
+                faltas[b] = 0
+                time.sleep(max(_BUFF_CAST_WAIT, random.gauss(_BUFF_CAST_WAIT, 0.2)))
+                _buff_back_to_main()
+        except Exception as e:
+            _log(f"[ERR] buff_monitor: {type(e).__name__}: {e}")
 
 
 def _read_px(hdc, x, y) -> tuple[int, int, int]:
@@ -1328,11 +2012,8 @@ def _sig_a(c) -> bool:
     return r > 70 and r >= g + 30 and r >= b + 30
 
 def _sig_b(c) -> bool:
+    # PT EU apenas — o Wartale usa _war_px (faixas HSV vindas dos assets).
     r, g, b = c
-    global _GAME
-    if _GAME == "skytale":
-        # SkyTale SP bar is yellow/orange
-        return (r > 100 and g > 100 and b < 100) or (g > 100 and g > r * 2.0 and g > b * 2.0)
     # bright green; multiplier 2.0 to handle near-white bar glow
     return g > 100 and g > r * 2.0 and g > b * 2.0
 
@@ -1351,12 +2032,101 @@ user32.GetCursorPos.restype  = wt.BOOL
 user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
 
 
+_REPOT_LABELS = ('hp', 'sp', 'mp')
+
+
+def _repot_ratio(slot_idx: int) -> tuple | None:
+    """Ratio (rx, ry) da pocao do slot dentro do inventario, ou None se a
+    resolucao atual nao mapeou os passos extras."""
+    return (_RA_R, _RB_R, _RC_R)[slot_idx]
+
+
+def _repot_slot(slot_idx: int) -> bool:
+    """Reabastece um slot de pot vazio pela mochila (Wartale).
+
+    Sequencia: guarda a posicao do cursor -> V (abre inventario) -> espera 2s ->
+    cursor sobre a pocao mapeada -> SHIFT+<slot> -> cursor de volta pro ponto
+    original -> V (fecha inventario).
+
+    Roda INLINE no _probe_loop (thread unica) e levanta state.repotting, entao
+    nenhuma outra thread manda tecla/click enquanto o SHIFT esta segurado.
+    """
+    if _GAME != "wartale" or _ic is None:
+        return False
+    ratio = _repot_ratio(slot_idx)
+    if ratio is None:
+        return False
+    hwnd = _locate_window()
+    dims = _query_viewport(hwnd) if hwnd else None
+    if dims is None:
+        return False
+    if not _target_window_focused():
+        return False
+
+    w, h, ox, oy = dims
+    tx, ty = _to_screen(ratio[0], ratio[1], w, h, ox, oy)
+    # Jitter de coordenada — nunca clicar no mesmo pixel exato (WarningMacroMouse).
+    tx += random.randint(-_REPOT_JIT_PX, _REPOT_JIT_PX)
+    ty += random.randint(-_REPOT_JIT_PX, _REPOT_JIT_PX)
+
+    origin = _cursor_pos()
+    key    = str(slot_idx + 1)
+    label  = _REPOT_LABELS[slot_idx]
+
+    state.repotting = True
+    inv_open = False
+    try:
+        _log(f"[INV] {label} slot empty — refill via bag at ({tx},{ty})")
+        _ic.send_key('v', hold_sec=_human_hold())
+        inv_open = True
+        # 2s de espera pedidos + jitter humano por cima (nunca abaixo de 2s).
+        time.sleep(_REPOT_OPEN_WAIT + max(0.0, random.gauss(0.25, 0.10)))
+
+        if not _move_cursor_to(_ic, tx, ty):
+            _log(f"[INV] {label} cursor did not reach the item — aborting")
+            return False
+
+        _sleep_human(0.12, 0.28)
+        # SHIFT segurado, tecla do slot batida, SHIFT solto (finally no wrapper).
+        _ic.send_combo('shift', key, hold_sec=_human_hold(0.04, 0.09),
+                       pre_sec=random.uniform(0.05, 0.11),
+                       post_sec=random.uniform(0.06, 0.13))
+        _sleep_human(0.18, 0.35)
+        _log(f"[INV] {label} SHIFT+{key} sent")
+        return True
+    except Exception as e:
+        _log(f"[ERR] repot {label}: {type(e).__name__}: {e}")
+        return False
+    finally:
+        # Cursor volta pro ponto de origem ANTES de fechar — o jogo usa a
+        # posicao do mouse pra mirar/andar, entao nao pode ficar na mochila.
+        if origin is not None:
+            _move_cursor_to(_ic, origin[0], origin[1])
+        if inv_open:
+            try:
+                _sleep_human(0.10, 0.22)
+                _ic.send_key('v', hold_sec=_human_hold())
+            except Exception:
+                pass
+        state.repotting = False
+
+
 def _probe_loop() -> None:
     try:
         last_pot          = {'1': 0.0, '2': 0.0, '3': 0.0}  # debounce por slot
+        empty_since       = [0.0, 0.0, 0.0]  # monotonic em que o slot ficou vazio
+        last_repot        = [0.0, 0.0, 0.0]
+        repot_tries       = [0, 0, 0]     # tentativas seguidas sem resolver
         _hwnd             = None
         _dims             = None
         _bar_xs           = None
+        _war_xs           = [None, None, None]   # x de cada barra (Wartale)
+        _war_ws           = [0, 0, 0]            # largura detectada de cada barra
+        _war_locked       = [False, False, False]  # x ja confirmado por coluna alta
+        _war_bottoms      = [None, None, None]   # base de cada barra (Wartale)
+        _war_bot_locked   = [False, False, False]
+        _war_dims_key     = None                 # invalida os caches se a res mudar
+        _next_diag        = 0.0                  # proximo log de diagnostico
         _slot_positions   = None
         _slot_empty_tmpl  = [None, None, None]
         _next_refresh     = 0.0
@@ -1382,8 +2152,64 @@ def _probe_loop() -> None:
                     _log(f"[CFG] resolution {w}x{h} -> profile {applied[0]}x{applied[1]}")
                 hdc_s = user32.GetDC(None)
                 try:
-                    hp_x, sp_x, mp_x = _scan_hud(hdc_s, w, h, ox, oy)
+                    if _GAME == "wartale":
+                        # Resolucao mudou: a geometria travada nao vale mais.
+                        if _war_dims_key != (w, h, ox, oy):
+                            _war_dims_key   = (w, h, ox, oy)
+                            _war_xs         = [None, None, None]
+                            _war_ws         = [0, 0, 0]
+                            _war_bottoms    = [None, None, None]
+                            _war_locked     = [False, False, False]
+                            _war_bot_locked = [False, False, False]
+                        # x vem da imagem e e TRAVADO na primeira deteccao de
+                        # alta confianca (coluna alta = barra de verdade). Sem
+                        # travar, um refresh que pegasse ruido reescrevia um x
+                        # bom por um ruim — no log o sp oscilava 863/1012/1182
+                        # enquanto hp e mp, de cor rara na HUD, ficavam firmes.
+                        found = _war_scan_bars(hdc_s, w, h, ox, oy)
+                        for _i, _v in enumerate(found):
+                            if _v is None or _war_locked[_i]:
+                                continue
+                            _war_xs[_i] = _v[0]
+                            _war_ws[_i] = _v[2]
+                            if _v[1] >= _WAR_XLOCK_ROWS:
+                                _war_locked[_i] = True
+                                _log(f"[MON] war bar {_i} x={_v[0]} w={_v[2]} "
+                                     f"travado (coluna={_v[1]}px)")
+                        hp_x, sp_x, mp_x = _war_xs
+                    else:
+                        hp_x, sp_x, mp_x = _scan_hud(hdc_s, w, h, ox, oy)
                     _bar_xs = (hp_x, sp_x, mp_x)
+                    # Wartale: acha a BASE de cada barra pela propria imagem.
+                    # Achou uma vez, guarda — o HUD e desenhado em pixel fixo,
+                    # entao a geometria nao muda na sessao. O cache tambem
+                    # cobre o caso "barra em 0%", quando nao ha o que detectar.
+                    if _GAME == "wartale":
+                        y_hint = oy + int(0.95 * h)
+                        y_max  = oy + h - 1      # nunca varrer fora do jogo
+                        for _bi, _code in enumerate('abc'):
+                            if _war_xs[_bi] is None or _war_bot_locked[_bi]:
+                                continue
+                            got = _war_find_bottom(hdc_s, _war_xs[_bi], _war_ws[_bi],
+                                                   y_hint, y_max, _WAR_BARS[_code])
+                            if got is not None:
+                                _war_bottoms[_bi] = got
+                                # Base achada com x ja confiavel: congela junto.
+                                if _war_locked[_bi]:
+                                    _war_bot_locked[_bi] = True
+                        # Barra que subiu com pouquissimo fill (1-2 linhas) nao
+                        # da pra localizar sozinha. As 3 compartilham a mesma
+                        # baseline (nos profiles mapeados a diferenca entre ZA,
+                        # ZB e ZC fica em ~1px), entao herda a mediana das que
+                        # ja foram achadas. Deteccao real sobrescreve depois.
+                        _known = [b for b in _war_bottoms if b is not None]
+                        if _known:
+                            _base = sorted(_known)[len(_known) // 2]
+                            for _bi in range(3):
+                                if _war_bottoms[_bi] is None:
+                                    _war_bottoms[_bi] = _base
+                        _log(f"[MON] war xs={_war_xs} bottoms={_war_bottoms} "
+                             f"(hint={y_hint} max={y_max})")
                     s1_pos = _to_screen(*_PA_R, w, h, ox, oy)
                     s2_pos = _to_screen(*_PB_R, w, h, ox, oy)
                     s3_pos = _to_screen(*_PC_R, w, h, ox, oy)
@@ -1424,9 +2250,34 @@ def _probe_loop() -> None:
             # Per-tick: pixel-counting bar percentages + slot pixel reads
             hdc = user32.GetDC(None)
             try:
-                hp_pct = _bar_pct(hdc, hp_x, _ZA_R, h, oy, _sig_a)
-                sp_pct = _bar_pct(hdc, sp_x, _ZB_R, h, oy, _sig_b)
-                mp_pct = _bar_pct(hdc, mp_x, _ZC_R, h, oy, _sig_c)
+                if _GAME == "wartale":
+                    # Geometria do asset: altura constante + x/base cacheados.
+                    # Enquanto a barra nunca foi localizada, -1 = "leitura
+                    # indisponivel" e nenhum pot dispara as cegas.
+                    def _war_read(i, bx, code):
+                        bot = _war_bottoms[i]
+                        if bx is None or bot is None or _war_ws[i] <= 0:
+                            return -1
+                        return _war_bar_pct(hdc, bx, _war_ws[i], bot,
+                                            _WAR_BARS[code])
+                    hp_pct = _war_read(0, hp_x, 'a')
+                    sp_pct = _war_read(1, sp_x, 'b')
+                    mp_pct = _war_read(2, mp_x, 'c')
+                    # Diagnostico periodico das 3 barras. HP e MP entram como
+                    # controle: eles ja potam certo, entao o mapa deles mostra
+                    # como e um mapa saudavel pra comparar com o da stamina.
+                    if _WAR_DIAG and time.monotonic() >= _next_diag:
+                        _next_diag = time.monotonic() + _WAR_DIAG_PERIOD
+                        _log(f"[SPD] --- hp={hp_pct}% sp={sp_pct}% mp={mp_pct}% ---")
+                        for _di, _dc in enumerate('abc'):
+                            if (_bar_xs[_di] is not None and _war_ws[_di] > 0
+                                    and _war_bottoms[_di] is not None):
+                                _war_diag(hdc, _dc, _bar_xs[_di], _war_ws[_di],
+                                          _war_bottoms[_di])
+                else:
+                    hp_pct = _bar_pct(hdc, hp_x, _ZA_R, h, oy, _sig_a)
+                    sp_pct = _bar_pct(hdc, sp_x, _ZB_R, h, oy, _sig_b)
+                    mp_pct = _bar_pct(hdc, mp_x, _ZC_R, h, oy, _sig_c)
                 s1_c = _read_px(hdc, *s1_pos)
                 s2_c = _read_px(hdc, *s2_pos)
                 s3_c = _read_px(hdc, *s3_pos)
@@ -1436,8 +2287,23 @@ def _probe_loop() -> None:
             _dbg_tick += 1
 
             def _empty(tmpl_r, px_c) -> bool:
+                # Quem decide "slot sem pocao" e o TEMPLATE (match SAD sobre a
+                # imagem inteira do slot). O pixel central so entra como plano
+                # B, quando o template nao pode ser calculado.
+                #
+                # Combinar os dois nao funciona, em nenhuma das ordens, porque
+                # _no_signal olha UM pixel e erra nas DUAS direcoes:
+                #   OR  -> pixel escuro num slot CHEIO dava "vazio" e travava o
+                #          pot; no log, 32 de 32 amostras com o template
+                #          dizendo s1=False, ate o personagem morrer.
+                #   AND -> pixel claro num slot VAZIO vetava o template; o slot
+                #          de mana acusou vazio 14 vezes e o repot nunca rodou,
+                #          porque ali o vazio nao e escuro como no de vida.
+                # Um pixel nao carrega essa decisao. O template carrega: disse
+                # "cheio" em 283 de 300 refreshes e so acusou vazio quando as
+                # pocoes tinham acabado de verdade.
                 if tmpl_r is not None:
-                    return tmpl_r or _no_signal(px_c)
+                    return bool(tmpl_r)
                 return _no_signal(px_c)
 
             if _dbg_tick % 10 == 0:
@@ -1478,17 +2344,65 @@ def _probe_loop() -> None:
                 except Exception as e:
                     _log(f"[ERR] {label} send_key EXC: {type(e).__name__}: {e}")
 
+            # Repot (Wartale): slot vazio por _REPOT_CONFIRM ticks seguidos ->
+            # reabastece pela mochila. Roda INLINE (mesma thread do pot) pra
+            # nunca competir com o pot pela serial. Backoff exponencial impede
+            # loop infinito quando a mochila tambem esta sem pocao.
+            did_repot = False
+            if _GAME == "wartale":
+                now_r = time.monotonic()
+                for _i in range(3):
+                    if not _empty(_slot_empty_tmpl[_i], (s1_c, s2_c, s3_c)[_i]):
+                        # Slot com pocao: zera a janela de confirmacao e o
+                        # backoff (o ultimo repot funcionou).
+                        empty_since[_i] = 0.0
+                        repot_tries[_i] = 0
+                        continue
+                    if empty_since[_i] == 0.0:
+                        empty_since[_i] = now_r
+                    if (now_r - empty_since[_i] < _REPOT_CONFIRM
+                            or _repot_ratio(_i) is None
+                            or not _can_probe()):
+                        continue
+                    cd = min(_REPOT_CD_MAX,
+                             _REPOT_CD * (_REPOT_BACKOFF ** repot_tries[_i]))
+                    if now_r - last_repot[_i] < cd:
+                        continue
+                    _log(f"[INV] slot {_i} vazio confirmado: "
+                         f"tmpl={_slot_empty_tmpl[_i]} "
+                         f"px={(s1_c, s2_c, s3_c)[_i]}")
+                    fired_repot = _repot_slot(_i)
+                    last_repot[_i]  = time.monotonic()
+                    empty_since[_i] = 0.0
+                    if fired_repot:
+                        repot_tries[_i] = min(repot_tries[_i] + 1, 8)
+                    # Reavalia o template do slot no proximo tick (o cache de
+                    # 5s ainda diria "vazio" mesmo com a pocao ja reposta).
+                    _next_refresh = 0.0
+                    did_repot = True
+                    break   # um repot por tick — dims/estado ja estao velhos
+
+            # O ciclo de repot leva ~4s: as barras lidas acima sao passado.
+            # Volta pro topo e re-le antes de decidir qualquer pot.
+            if did_repot:
+                continue
+
             # Cada barra que cruza o threshold dispara, todas no mesmo tick. HP
             # vai primeiro (prioridade); SP/MP nao esperam — se varias precisam,
             # todas sao usadas. Cada uma tem sua micro-reacao gaussiana.
-            hp_low = hp_pct < _settings.pot_hp_pct
+            # pct < 0 = leitura indisponivel (barra nao localizada). Nunca
+            # dispara pot nesse caso — chute as cegas gasta pocao a toa.
+            def _low(pct: int, thr: int) -> bool:
+                return 0 <= pct < thr
+
+            hp_low = _low(hp_pct, _settings.pot_hp_pct)
             state.hp_critical = hp_low and hp_pct <= max(1, _settings.pot_hp_pct // 2)
 
             if hp_low:
                 _try_pot('1', hp_pct, _settings.pot_hp_pct, 0, s1_c, last_pot, 'hp')
-            if sp_pct < _settings.pot_sp_pct:
+            if _low(sp_pct, _settings.pot_sp_pct):
                 _try_pot('2', sp_pct, _settings.pot_sp_pct, 1, s2_c, last_pot, 'sp')
-            if mp_pct < _settings.pot_mp_pct:
+            if _low(mp_pct, _settings.pot_mp_pct):
                 _try_pot('3', mp_pct, _settings.pot_mp_pct, 2, s3_c, last_pot, 'mp')
 
             # (scan de Soul movido pra _soul_loop, thread separada — antes ele
@@ -1497,9 +2411,9 @@ def _probe_loop() -> None:
             # Tick rate adaptativo: quase 0 (5ms) enquanto algum pct esta baixo —
             # mata o delay entre uma pot e a proxima; 50ms ocioso (detecta queda
             # rapido) quando tudo OK, ainda economico de CPU.
-            any_low = (hp_pct < _settings.pot_hp_pct or
-                       sp_pct < _settings.pot_sp_pct or
-                       mp_pct < _settings.pot_mp_pct)
+            any_low = (hp_low or
+                       _low(sp_pct, _settings.pot_sp_pct) or
+                       _low(mp_pct, _settings.pot_mp_pct))
             time.sleep(0.005 if any_low else 0.05)
 
     except Exception:
@@ -1610,7 +2524,7 @@ def _sync_scheduler() -> None:
     while not state.stop:
         # Base do settings (5-10 min) + jitter humano.
         base = _settings.rebuff_minutes * 60.0
-        wait = base + random.uniform(_JITTER_LO, _JITTER_HI)
+        wait = base * (1.0 + random.uniform(_JITTER_FRAC_LO, _JITTER_FRAC_HI))
         deadline = time.monotonic() + wait
 
         while time.monotonic() < deadline and not state.stop:
@@ -1738,7 +2652,7 @@ def _select_game() -> str | None:
         choice["game"] = gid
         root.destroy()
 
-    for gid in ("pt_eu", "skytale"):
+    for gid in ("pt_eu", "wartale"):
         g = _GAMES[gid]
         tk.Button(root, text=g["label"], command=lambda x=gid: _pick(x),
                   bg="#5865f2", fg="white", activebackground="#3b3f7a",
@@ -1758,7 +2672,7 @@ def _apply_game(game_id: str) -> None:
     _locate_window e aponta a config para o dir isolado do jogo, recarregando
     state/settings/resolucoes a partir dele."""
     global _GAME, _TITLE_PFX, _CFG_DIR, _STATE_FILE, _RES_FILE
-    global _hud_state, _settings, _RES_PROFILES
+    global _hud_state, _settings, _RES_PROFILES, _BUFF_FILE
 
     g = _GAMES.get(game_id) or _GAMES["pt_eu"]
     _GAME       = game_id
@@ -1766,6 +2680,7 @@ def _apply_game(game_id: str) -> None:
     _CFG_DIR    = os.path.join(_base_dir, g["cfg_sub"])
     _STATE_FILE = os.path.join(_CFG_DIR, "state.json")
     _RES_FILE   = os.path.join(_CFG_DIR, "resolutions.json")
+    _BUFF_FILE  = os.path.join(_CFG_DIR, "buffs.json")
     try:
         os.makedirs(_CFG_DIR, exist_ok=True)
     except Exception:
@@ -1774,6 +2689,7 @@ def _apply_game(game_id: str) -> None:
     # resolucoes: parte dos built-ins e sobrepoe as custom especificas do jogo
     _RES_PROFILES = {k: dict(v) for k, v in _RES_BUILTINS.items()}
     _load_resolutions()
+    _load_buffs()          # templates de buff capturados pelo usuario
 
     # perfis/state sao carregados do dir do jogo (independentes entre jogos)
     _hud_state = _load_hud_state()
@@ -1852,6 +2768,11 @@ def main() -> None:
         get_resolution=_current_resolution,
         capture_ratio=_capture_ratio,
         save_mapping=_save_resolution_mapping,
+        # Wartale: wizard ganha 3 passos extras (pocoes no inventario) que
+        # alimentam o repot automatico.
+        map_inventory=(_GAME == "wartale"),
+        buff_labels=_BUFF_LABELS,
+        buff_mapped=_buff_mapped,
     )
     threading.Thread(target=_hud.run, daemon=True, name=_tname()).start()
     _hud.wait_ready(timeout=3.0)
