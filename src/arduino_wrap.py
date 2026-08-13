@@ -289,18 +289,24 @@ class ArduinoHID:
         time.sleep(delay)
 
     def send_mouse_click(self, double: bool = False, right: bool = False) -> None:
-        """Click com jitter de hand-tremor + delay beta-distribuído entre down/up."""
+        """Click NO LUGAR, com delay beta-distribuído entre down e up.
+
+        O cursor nao e deslocado aqui. Havia um tremor de +-2px antes de cada
+        clique (e +-1px antes do segundo, no double) que servia de dirty trail
+        anti-heatmap; foi removido a pedido do usuario. Quem chama decide a
+        coordenada e o clique cai exatamente nela.
+
+        A variacao humana que sobra e TEMPORAL: o intervalo down/up continua
+        beta-distribuido, e o pre-delay gaussiano de _human_click tambem.
+        """
         btn = 'R' if right else 'L'
 
-        # Tremor primário ±2px antes do click — dirty trail anti-heatmap
-        self.move_relative(random.randint(-2, 2), random.randint(-2, 2))
         self._write_line(f"MD{btn}")
         self._human_delay(0.015, 0.080)
         self._write_line(f"MU{btn}")
 
         if double:
             self._human_delay(0.040, 0.120)
-            self.move_relative(random.randint(-1, 1), random.randint(-1, 1))
             self._write_line(f"MD{btn}")
             self._human_delay(0.010, 0.065)
             self._write_line(f"MU{btn}")

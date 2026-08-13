@@ -1132,9 +1132,9 @@ def _spam_right_click(ic, duration: float, abortar=None) -> int:
     Retorna quantos cliques sairam (log).
 
     A taxa alvo e sorteada a CADA clique dentro de _SYNC_SPAM_HZ_LO..HI e o
-    tempo gasto no proprio clique (send_mouse_click ja tem tremor + delay beta
-    entre down/up) e descontado do intervalo — assim a taxa real fica na faixa
-    pedida em vez de derivar pra baixo.
+    tempo gasto no proprio clique (send_mouse_click tem delay beta entre down e
+    up) e descontado do intervalo — assim a taxa real fica na faixa pedida em
+    vez de derivar pra baixo.
     """
     if ic is None or duration <= 0:
         return 0
@@ -1662,7 +1662,10 @@ def _war_candidates(cap, bw: int, band_h: int, x_lo_abs: int,
 # Ponto neutro no meio da HUD (entre os dois orbes), preenchido pelo probe loop
 # a partir da geometria ja detectada das barras. Outras threads so leem.
 _g_hud_center: tuple | None = None
-_HUD_CENTER_DY = 70      # px acima da base das barras — vao escuro acima dos orbes
+# px acima da base das barras. 95 mantem o ponto dentro do vao vertical que as
+# proprias barras ocupam (a HP tem 94px), entao ele nao sobe pra fora da HUD —
+# ali em cima o right-click do rebuff viraria andar/atacar no campo de jogo.
+_HUD_CENTER_DY = 95
 
 
 def _hud_center(ox: int, oy: int, w: int, h: int,
@@ -1695,9 +1698,8 @@ def _park_mouse():
         return None
     orig = _cursor_pos()
     cx, cy = _g_hud_center
-    # Pixel exato, sem jitter (pedido do usuario). O clique em si ainda varia:
-    # send_mouse_click aplica tremor de +-2px antes de apertar, entao o ponto
-    # clicado nao fica literalmente fixo.
+    # Pixel exato, sem jitter (pedido do usuario). O clique tambem nao desloca
+    # mais o cursor, entao o ponto clicado e literalmente este.
     _move_cursor_to(_ic, cx, cy)
     return orig
 
