@@ -65,6 +65,8 @@ class HUD:
         map_inventory: bool = False,
         buff_labels: dict = None,
         buff_mapped: Callable[[str], bool] = None,
+        get_rebuff_eta: Callable[[], float] = None,
+        war_bars_opt: bool = False,
     ):
         self._runtime    = settings
         self._hud_state  = hud_state
@@ -74,12 +76,16 @@ class HUD:
         self._on_use     = on_use
         self._on_state   = on_state_change
         self._get_active = get_active
+        self._get_eta    = get_rebuff_eta
         self._resolutions = resolutions or []
         self._get_res     = get_resolution
         self._capture     = capture_ratio
         self._save_map    = save_mapping
         # Wartale: mapeia tambem as 3 pocoes dentro do inventario (repot).
         self._map_inv     = bool(map_inventory)
+        # Wartale: deixa o usuario escolher entre barras automaticas e mapeadas
+        # a mao. No PT EU nao existe escolha — sempre foi manual.
+        self._war_opt     = bool(war_bars_opt)
         # BUFF: rotulos vem do core (dependem da classe); captura e persistencia
         # do template do icone tambem, pra HUD nao saber de captura de tela.
         self._buff_labels = buff_labels or {}
@@ -128,6 +134,8 @@ class HUD:
         self._mini        = None
         self._mini_lbl    = None
         self._badge_state = None
+        self._eta_lbl     = None   # regressivo do rebuff, sob o badge
+        self._eta_txt     = None   # ultimo texto desenhado (evita reflow por tick)
 
     # ── thread entrypoint ─────────────────────────────────────────────────
     def run(self):
@@ -551,6 +559,28 @@ class HUD:
     def _build_res(self, frame):
         self._section_title(frame, "Resolucao")
 
+        # Wartale: automatico x manual. Fica ANTES do botao Mapear de proposito
+        # — a escolha muda quantos passos o wizard vai pedir.
+        if self._war_opt:
+            v_bm = tk.BooleanVar(
+                value=bool(getattr(self._working, "war_bars_manual", False)))
+            tk.Checkbutton(
+                frame, text="mapear HP/SP/MP a mao", variable=v_bm,
+                bg=_BG, fg=_FG, selectcolor=_PANEL,
+                activebackground=_BG, activeforeground=_FG,
+                font=("Segoe UI", 9), command=self._mark_dirty,
+            ).pack(anchor="w")
+            tk.Label(
+                frame,
+                text="Desmarcado: o macro acha as barras sozinho (padrao).\n"
+                     "Marcado: voce clica topo e base de cada barra no\n"
+                     "wizard, como no PT EU. Use se a leitura automatica\n"
+                     "errar nesta resolucao. Depois de marcar, mapeie de novo.",
+                bg=_BG, fg=_MUTED, font=("Segoe UI", 8),
+                wraplength=290, justify="left",
+            ).pack(anchor="w", pady=(0, 8))
+            self._tk_vars["war_bars_manual"] = v_bm
+
         # Resolucao atual do jogo (live, atualizada no _tick)
         cur_box = tk.Frame(frame, bg=_PANEL)
         cur_box.pack(fill="x", pady=(0, 6))
@@ -642,6 +672,19 @@ class HUD:
                                      if self._resolutions else "(nenhuma)"))
         self._last_res = None       # forca _refresh_res_status a reavaliar
         self._refresh_res_status()
+
+    def _war_bars_manual(self) -> bool:
+        """Estado ATUAL da opcao 'mapear a mao'. Le a tk var e nao o profile
+        salvo: o usuario costuma marcar a caixa e clicar em Mapear direto, sem
+        passar pelo Salvar — e o wizard tem que pedir os passos certos assim
+        mesmo."""
+        var = self._tk_vars.get("war_bars_manual")
+        if var is not None:
+            try:
+                return bool(var.get())
+            except Exception:
+                pass
+        return bool(getattr(self._working, "war_bars_manual", False))
 
     def _open_map_wizard(self):
         if self._wizard is not None:
@@ -868,13 +911,33 @@ class HUD:
             m.attributes("-alpha", 0.92)
             m.configure(bg=_SUCCESS)
             lbl = tk.Label(m, text="●", bg=_SUCCESS, fg="white",
-                           font=("Segoe UI", 9, "bold"), padx=12, pady=5)
-            lbl.pack()
+                           font=("Segoe UI", 9, "bold"))
+            lbl.pack(padx=12, pady=5)
+            # Regressivo do rebuff — fonte monoespacada de proposito: com Segoe
+            # a largura mudaria a cada segundo e o badge (ancorado pela direita)
+            # ficaria tremendo de lado. So e empacotado quando ha agenda.
+            eta = tk.Label(m, text="", bg=_SUCCESS, fg="white",
+                           font=("Consolas", 8))
             self._mini = m
             self._mini_lbl = lbl
+            self._eta_lbl = eta
         except Exception:
             self._mini = None
             self._mini_lbl = None
+            self._eta_lbl = None
+
+    def _place_mini(self):
+        """Reancora o badge no canto superior direito. Precisa rodar sempre que a
+        largura muda (troca de texto do badge ou do regressivo)."""
+        if self._mini is None:
+            return
+        try:
+            self._mini.update_idletasks()
+            sw = self._mini.winfo_screenwidth()
+            bw = self._mini.winfo_reqwidth()
+            self._mini.geometry(f"+{sw - bw - 12}+12")
+        except Exception:
+            pass
 
     def _update_badge(self, active: bool):
         """Atualiza texto/cor do badge conforme o estado. So reescreve na mudanca."""
@@ -889,12 +952,42 @@ class HUD:
         try:
             self._mini.configure(bg=bg)
             self._mini_lbl.configure(text=txt, bg=bg)
-            self._mini.update_idletasks()
-            sw = self._mini.winfo_screenwidth()
-            bw = self._mini.winfo_reqwidth()
-            self._mini.geometry(f"+{sw - bw - 12}+12")   # canto superior direito
+            if self._eta_lbl is not None:
+                self._eta_lbl.configure(bg=bg)
         except Exception:
             pass
+        self._place_mini()
+
+    def _update_eta(self, active: bool):
+        """Regressivo ate o proximo rebuff, logo abaixo do Executando/Parado.
+        Some quando o macro esta parado ou a agenda ainda nao foi armada."""
+        if self._mini is None or self._eta_lbl is None:
+            return
+        txt = ""
+        if active and self._get_eta is not None:
+            try:
+                eta = self._get_eta()
+            except Exception:
+                eta = None
+            if eta is not None:
+                if eta < 0:
+                    txt = "rebuffando"
+                else:
+                    s = int(eta + 0.5)
+                    txt = f"rebuff {s // 60}:{s % 60:02d}"
+        if txt == self._eta_txt:
+            return
+        self._eta_txt = txt
+        try:
+            if txt:
+                self._eta_lbl.configure(text=txt)
+                if not self._eta_lbl.winfo_ismapped():
+                    self._eta_lbl.pack(padx=12, pady=(0, 5))
+            else:
+                self._eta_lbl.pack_forget()
+        except Exception:
+            return
+        self._place_mini()
 
     # ── tick ──────────────────────────────────────────────────────────────
     def _tick(self):
@@ -931,6 +1024,7 @@ class HUD:
         # Badge permanente: a partir daqui so alterna Executando/Parado.
         if self._mini is not None:
             self._update_badge(active)
+            self._update_eta(active)
         # Status + poll de resolucao so enquanto a config existe (antes de ligar).
         if self.win is not None:
             self._update_status(active)
@@ -985,11 +1079,14 @@ class _MapWizard:
     def __init__(self, hud: "HUD", res: tuple):
         self._hud   = hud
         self._w, self._h = int(res[0]), int(res[1])
-        # Wartale: as barras nao sao mais mapeadas — a geometria sai dos assets
-        # do cliente (altura fixa em px + base detectada por cor), entao o
-        # wizard cai de 9 pra 6 passos: 3 slots de pote + 3 pocoes no inventario.
+        # Wartale: no automatico as barras nao sao mapeadas — a geometria sai
+        # dos assets do cliente (altura fixa em px + base detectada por cor), e
+        # o wizard cai de 9 pra 6 passos: 3 slots + 3 pocoes no inventario. Com
+        # "mapear a mao" marcado, os 6 passos de barra voltam (12 no total).
         if getattr(hud, "_map_inv", False):
             self._steps = list(self._STEPS_SLOTS) + list(self._STEPS_INV)
+            if hud._war_bars_manual():
+                self._steps = list(self._STEPS_BARS) + self._steps
         else:
             self._steps = list(self._STEPS)
         self._step  = 0

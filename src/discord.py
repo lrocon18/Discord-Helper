@@ -105,6 +105,12 @@ class Settings:
     soul_beep: bool = True
     # RESOLUCAO ("auto" = detecta a mais proxima | "WxH" = forca essa)
     forced_resolution: str = "auto"
+    # WARTALE — de onde vem a GEOMETRIA das barras de HP/SP/MP:
+    #   False -> automatico: x e base achados pela cor, altura vem do asset
+    #   True  -> manual: topo e base mapeados no wizard, como no PT EU
+    # So a geometria muda. A cor continua sendo a do Wartale (_WAR_BARS) nos
+    # dois modos — mapear a mao nao torna a barra vermelha do PT EU.
+    war_bars_manual: bool = False
 
 
 def _profile_path(name: str) -> str:
@@ -202,6 +208,21 @@ def _set_active_profile(name: str) -> None:
 def _is_active() -> bool:
     """Callback pra HUD mostrar status do macro."""
     return state.active
+
+
+def _rebuff_eta() -> float | None:
+    """Segundos ate o proximo rebuff, pra HUD.
+
+    None  = agenda ainda nao armada (macro nao ligou / primeiro buff pendente)
+    -1.0  = rebuff acontecendo agora
+    >= 0  = quanto falta
+    """
+    if state.syncing:
+        return -1.0
+    alvo = state.next_sync_at
+    if alvo <= 0.0:
+        return None
+    return max(0.0, alvo - time.monotonic())
 
 
 def _log(msg: str) -> None:
@@ -524,6 +545,10 @@ _RA_R: tuple | None = None
 _RB_R: tuple | None = None
 _RC_R: tuple | None = None
 _CUR_PROFILE: tuple | None = None
+# O profile aplicado traz ZA/ZB/ZC (topo/base das barras)? Sem isso o modo
+# manual do Wartale nao tem o que ler — _ZA_R ficaria no default do PT EU e o
+# macro leria a faixa errada da tela. Nesse caso cai no automatico.
+_ZMAP_OK: bool = False
 
 
 def _parse_resolution(s: str) -> tuple | None:
@@ -546,7 +571,7 @@ def _apply_resolution_profile(w: int, h: int) -> tuple | None:
     """Seleciona profile pelo settings (se forced != 'auto') ou pelo mais proximo
     de (w, h). Retorna a chave aplicada se mudou; None se nao mudou."""
     global _ZA_R, _ZB_R, _ZC_R, _PA_R, _PB_R, _PC_R, _CUR_PROFILE
-    global _RA_R, _RB_R, _RC_R
+    global _RA_R, _RB_R, _RC_R, _ZMAP_OK
     if not _RES_PROFILES:
         return None
 
@@ -563,11 +588,23 @@ def _apply_resolution_profile(w: int, h: int) -> tuple | None:
     # ZA/ZB/ZC (topo/base das barras) so existem em profiles do PT EU e nos
     # antigos do Wartale — o Wartale agora deriva a geometria dos assets
     # (_WAR_BARS) e nao mapeia mais isso. Ausentes = mantem o default.
+    # Mapeamento manual so vale se o profile trouxer ZA/ZB/ZC E tiver sido
+    # escolhido DE PROPOSITO pra esta tela — casando exato com a resolucao ou
+    # forcado pelo usuario. O vizinho mais proximo nao serve: os built-ins do
+    # PT EU sao a base tambem do Wartale, e a HUD do Wartale e desenhada em
+    # pixel fixo, entao um ratio de outra resolucao aponta pro lugar errado.
+    _ZMAP_OK = (all(k in p for k in ('ZA', 'ZB', 'ZC'))
+                and (target == (w, h) or target == forced))
     _ZA_R = p.get('ZA', _ZA_R); _ZB_R = p.get('ZB', _ZB_R); _ZC_R = p.get('ZC', _ZC_R)
     _PA_R = p['PA']; _PB_R = p['PB']; _PC_R = p['PC']
     # Opcionais — profiles antigos (mapeados antes do repot) nao tem essas chaves.
     _RA_R = p.get('RA'); _RB_R = p.get('RB'); _RC_R = p.get('RC')
     _CUR_PROFILE = target
+    if (_GAME == "wartale" and not _ZMAP_OK
+            and getattr(_settings, "war_bars_manual", False)):
+        _log(f"[CFG] barras manuais pedidas, mas {w}x{h} nao tem ZA/ZB/ZC "
+             f"(profile aplicado: {target[0]}x{target[1]}) — seguindo no "
+             f"automatico. Remapeie esta resolucao com a opcao marcada.")
     return target
 
 
@@ -750,6 +787,9 @@ class State:
     hp_pct: int = -1          # ultima leitura (-1 = desconhecida)
     hp_slot_empty: bool = False
     last_hp_pot: float = 0.0
+    # Deadline (monotonic) do proximo rebuff. 0.0 = agenda ainda nao armada.
+    # Publicado pelo _sync_scheduler pra HUD desenhar o regressivo.
+    next_sync_at: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def paused_by_user(self) -> bool:
@@ -1771,7 +1811,59 @@ def _war_bar_pct(hdc_src, bar_x: int, bar_w: int, bottom_y: int,
     return (filled * 100) // bh
 
 
-def _war_diag(hdc_src, code: str, bar_x: int, bar_w: int, bottom_y: int) -> None:
+def _war_manual() -> bool:
+    """Wartale com as barras mapeadas a mao pelo usuario (opcao da HUD).
+
+    Exige _ZMAP_OK: escolher "manual" sem ter mapeado ZA/ZB/ZC nesta resolucao
+    faria o macro ler o ratio default do PT EU, que aponta pra outro lugar da
+    tela. Sem o mapeamento a funcao devolve False e o automatico assume.
+    """
+    return (_GAME == "wartale" and _ZMAP_OK
+            and bool(getattr(_settings, "war_bars_manual", False)))
+
+
+def _war_bar_pct_manual(hdc_src, x_abs: int, y_top: int, y_bot: int,
+                        spec: tuple) -> int:
+    """Porcentagem da barra na janela MAPEADA a mao (topo e base clicados pelo
+    usuario no wizard). -1 = leitura indisponivel, mesmo contrato do automatico.
+
+    Diferenca unica pro _war_bar_pct: a geometria vem do mapeamento em vez do
+    asset. A contagem continua por LINHA e nao por pixel, porque o sheen branco
+    vertical existe nos dois modos e distorceria a contagem de pixels.
+
+    O usuario clica UM ponto por barra, entao a captura e centrada nele com a
+    largura do asset. Com o limiar de 25% por linha, errar o centro em ate ~1/4
+    da largura ainda le certo.
+    """
+    bh = y_bot - y_top + 1
+    if bh <= 0:
+        return -1
+    bw  = max(4, spec[0])
+    cap = _capture_region(hdc_src, x_abs - bw // 2, y_top, bw, bh)
+    if cap is None:
+        return -1
+    thr = max(1, bw // _WAR_ROW_PCT)
+    filled = 0
+    for row in range(bh):
+        if _war_hits(cap, row * bw * 4, bw, spec) >= thr:
+            filled += 1
+    return (filled * 100) // bh
+
+
+def _war_geom_manual(w: int, h: int, ox: int, oy: int) -> tuple:
+    """(xs, ws, bottoms) do mapeamento manual, no mesmo formato que o
+    automatico produz — assim _hud_center e os logs nao mudam."""
+    xs, ws, bots = [], [], []
+    for code, rat in zip('abc', (_ZA_R, _ZB_R, _ZC_R)):
+        bw = max(4, _WAR_BARS[code][0])
+        xs.append(ox + int(rat[0] * w) - bw // 2)
+        ws.append(bw)
+        bots.append(oy + int(rat[2] * h))
+    return xs, ws, bots
+
+
+def _war_diag(hdc_src, code: str, bar_x: int, bar_w: int, bottom_y: int,
+              top_y: int | None = None) -> None:
     """Diagnostico de uma barra. Responde uma pergunta so: quando a barra na
     TELA esta baixa, o macro esta vendo baixo?
 
@@ -1785,8 +1877,16 @@ def _war_diag(hdc_src, code: str, bar_x: int, bar_w: int, bottom_y: int) -> None
               pixel passou. E onde se le direto a cor do vazio.
     """
     spec = _WAR_BARS[code]
-    bh   = spec[1]
-    top  = bottom_y - bh + 1
+    # top_y != None: modo manual, a janela e a mapeada. Sem isso o dump sairia
+    # sobre a altura do asset e nao bateria com a % logada logo acima.
+    if top_y is None:
+        bh  = spec[1]
+        top = bottom_y - bh + 1
+    else:
+        top = top_y
+        bh  = bottom_y - top + 1
+    if bh <= 0:
+        return
     pad  = 6
     cw   = bar_w + pad * 2
     cap  = _capture_region(hdc_src, bar_x - pad, top, cw, bh)
@@ -2462,29 +2562,37 @@ def _probe_loop() -> None:
                             _war_bottoms    = [None, None, None]
                             _war_locked     = [False, False, False]
                             _war_bot_locked = [False, False, False]
-                        # x vem da imagem, so MELHORA e depois TRAVA.
-                        #
-                        # Antes qualquer deteccao sobrescrevia a anterior. Com a
-                        # barra baixa a confianca nao alcancava o minimo pra
-                        # travar, entao ela seguia redetectando — e num ciclo
-                        # agarrou ruido: o x da HP pulou de 879 (conf 56) pra
-                        # 769 com coluna vazia, e a leitura zerou com o
-                        # personagem vivo, sem pot. Agora uma geometria so cede
-                        # lugar a outra de confianca MAIOR, entao lixo fraco
-                        # nunca derruba uma leitura que estava funcionando.
-                        found = _war_scan_bars(hdc_s, w, h, ox, oy)
-                        for _i, _v in enumerate(found):
-                            if _v is None or _war_locked[_i]:
-                                continue
-                            if _v[1] <= _war_conf[_i]:
-                                continue
-                            _war_conf[_i] = _v[1]
-                            _war_xs[_i] = _v[0]
-                            _war_ws[_i] = _v[2]
-                            if _v[1] >= _WAR_XLOCK_ROWS:
-                                _war_locked[_i] = True
-                                _log(f"[MON] war bar {_i} x={_v[0]} w={_v[2]} "
-                                     f"travado (coluna={_v[1]}px)")
+                        if _war_manual():
+                            # Manual: a geometria inteira (x, largura e base) sai
+                            # do que o usuario clicou no wizard. Nao roda scan
+                            # nenhum — nao ha o que detectar, e um scan aqui so
+                            # poderia estragar o mapeamento.
+                            _war_xs, _war_ws, _war_bottoms = _war_geom_manual(
+                                w, h, ox, oy)
+                        else:
+                            # x vem da imagem, so MELHORA e depois TRAVA.
+                            #
+                            # Antes qualquer deteccao sobrescrevia a anterior. Com
+                            # a barra baixa a confianca nao alcancava o minimo pra
+                            # travar, entao ela seguia redetectando — e num ciclo
+                            # agarrou ruido: o x da HP pulou de 879 (conf 56) pra
+                            # 769 com coluna vazia, e a leitura zerou com o
+                            # personagem vivo, sem pot. Agora uma geometria so cede
+                            # lugar a outra de confianca MAIOR, entao lixo fraco
+                            # nunca derruba uma leitura que estava funcionando.
+                            found = _war_scan_bars(hdc_s, w, h, ox, oy)
+                            for _i, _v in enumerate(found):
+                                if _v is None or _war_locked[_i]:
+                                    continue
+                                if _v[1] <= _war_conf[_i]:
+                                    continue
+                                _war_conf[_i] = _v[1]
+                                _war_xs[_i] = _v[0]
+                                _war_ws[_i] = _v[2]
+                                if _v[1] >= _WAR_XLOCK_ROWS:
+                                    _war_locked[_i] = True
+                                    _log(f"[MON] war bar {_i} x={_v[0]} w={_v[2]} "
+                                         f"travado (coluna={_v[1]}px)")
                         hp_x, sp_x, mp_x = _war_xs
                     else:
                         hp_x, sp_x, mp_x = _scan_hud(hdc_s, w, h, ox, oy)
@@ -2493,7 +2601,7 @@ def _probe_loop() -> None:
                     # Achou uma vez, guarda — o HUD e desenhado em pixel fixo,
                     # entao a geometria nao muda na sessao. O cache tambem
                     # cobre o caso "barra em 0%", quando nao ha o que detectar.
-                    if _GAME == "wartale":
+                    if _GAME == "wartale" and not _war_manual():
                         y_hint = oy + int(0.95 * h)
                         y_max  = oy + h - 1      # nunca varrer fora do jogo
                         for _bi, _code in enumerate('abc'):
@@ -2517,10 +2625,15 @@ def _probe_loop() -> None:
                             for _bi in range(3):
                                 if _war_bottoms[_bi] is None:
                                     _war_bottoms[_bi] = _base
+                    # Centro da HUD (onde o rebuff estaciona o mouse) sai da
+                    # geometria das barras nos DOIS modos — fora do bloco acima,
+                    # senao o manual nunca o calcularia e o park iria pro nada.
+                    if _GAME == "wartale":
                         _g_hud_center = _hud_center(ox, oy, w, h, _war_xs,
                                                     _war_ws, _war_bottoms)
-                        _log(f"[MON] war xs={_war_xs} bottoms={_war_bottoms} "
-                             f"(hint={y_hint} max={y_max})")
+                        _log(f"[MON] war xs={_war_xs} ws={_war_ws} "
+                             f"bottoms={_war_bottoms} "
+                             f"modo={'manual' if _war_manual() else 'auto'}")
                     # Resolucao exatamente mapeada: usa o que o usuario mapeou.
                     # Qualquer outra: DERIVA da barra, porque o ratio de uma
                     # resolucao vizinha aponta pro lugar errado numa HUD de
@@ -2578,10 +2691,18 @@ def _probe_loop() -> None:
                     # Geometria do asset: altura constante + x/base cacheados.
                     # Enquanto a barra nunca foi localizada, -1 = "leitura
                     # indisponivel" e nenhum pot dispara as cegas.
+                    _manual = _war_manual()
+
                     def _war_read(i, bx, code):
                         bot = _war_bottoms[i]
                         if bx is None or bot is None or _war_ws[i] <= 0:
                             return -1
+                        if _manual:
+                            # Topo mapeado: a janela e a que o usuario clicou,
+                            # nao a altura fixa do asset.
+                            top = oy + int((_ZA_R, _ZB_R, _ZC_R)[i][1] * h)
+                            return _war_bar_pct_manual(hdc, bx + _war_ws[i] // 2,
+                                                       top, bot, _WAR_BARS[code])
                         return _war_bar_pct(hdc, bx, _war_ws[i], bot,
                                             _WAR_BARS[code])
                     # HP e lido SEMPRE. SP/MP so a cada _POT_AUX_EVERY ticks
@@ -2606,7 +2727,9 @@ def _probe_loop() -> None:
                             if (_bar_xs[_di] is not None and _war_ws[_di] > 0
                                     and _war_bottoms[_di] is not None):
                                 _war_diag(hdc, _dc, _bar_xs[_di], _war_ws[_di],
-                                          _war_bottoms[_di])
+                                          _war_bottoms[_di],
+                                          top_y=(oy + int((_ZA_R, _ZB_R, _ZC_R)[_di][1] * h)
+                                                 if _manual else None))
                 else:
                     hp_pct = _bar_pct(hdc, hp_x, _ZA_R, h, oy, _sig_a)
                     sp_pct = _bar_pct(hdc, sp_x, _ZB_R, h, oy, _sig_b)
@@ -3002,6 +3125,7 @@ def _sync_scheduler() -> None:
     # fim do ciclo — assim um sync que demorou (por espera de vida, por exemplo)
     # nao empurra todos os proximos e o intervalo nao acumula atraso.
     deadline = time.monotonic() + _settings.rebuff_minutes * 60.0
+    state.next_sync_at = deadline
 
     while not state.stop:
         while time.monotonic() < deadline and not state.stop:
@@ -3021,6 +3145,7 @@ def _sync_scheduler() -> None:
         agora = time.monotonic()
         if deadline <= agora:          # ciclo passou do proprio intervalo
             deadline = agora + base
+        state.next_sync_at = deadline
         _run_sync()
 
 
@@ -3248,6 +3373,7 @@ def main() -> None:
         on_use=_set_active_profile,
         on_state_change=_save_hud_state,
         get_active=_is_active,
+        get_rebuff_eta=_rebuff_eta,
         resolutions=resolution_keys(),
         get_resolution=_current_resolution,
         capture_ratio=_capture_ratio,
@@ -3255,6 +3381,7 @@ def main() -> None:
         # Wartale: wizard ganha 3 passos extras (pocoes no inventario) que
         # alimentam o repot automatico.
         map_inventory=(_GAME == "wartale"),
+        war_bars_opt=(_GAME == "wartale"),
         buff_labels=_BUFF_LABELS,
         buff_mapped=_buff_mapped,
     )
