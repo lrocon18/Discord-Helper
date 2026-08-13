@@ -123,6 +123,7 @@ class HUD:
         self._last_res     = None   # ultima (w,h) detectada (evita refresh redundante)
         self._res_poll_ctr = 0
         self._wizard       = None
+        self._scroll_canvas = None
         # mini-badge permanente (Executando/Parado) — assume apos a 1a ativacao
         self._mini        = None
         self._mini_lbl    = None
@@ -247,19 +248,14 @@ class HUD:
             b.pack(side="left", expand=True, fill="x", padx=1, pady=2)
             self._tab_btns[tab] = b
 
-        # ── content ──
-        content = tk.Frame(self.win, bg=_BG)
-        content.pack(fill="both", expand=True, padx=10, pady=(6, 0))
-        self._build_combate(self._make_tab(content, "COMBATE"))
-        self._build_pot(self._make_tab(content, "POT"))
-        self._build_buff(self._make_tab(content, "BUFF"))
-        self._build_drops(self._make_tab(content, "DROPS"))
-        self._build_res(self._make_tab(content, "RES"))
-
         # ── footer ──
-        tk.Frame(self.win, bg="#2a2a2a", height=1).pack(fill="x", pady=(8, 0))
+        # Empacotado ANTES do conteudo e ancorado embaixo: o packer do Tk serve
+        # os widgets na ordem em que sao empacotados, entao o conteudo (que
+        # cresce a cada aba nova) empurrava o SALVAR pra fora da janela. Assim
+        # o rodape reserva a altura dele primeiro e nunca some.
+        tk.Frame(self.win, bg="#2a2a2a", height=1).pack(side="bottom", fill="x")
         footer = tk.Frame(self.win, bg=_BG)
-        footer.pack(fill="x", padx=10, pady=(6, 10))
+        footer.pack(side="bottom", fill="x", padx=10, pady=(6, 10))
 
         self._editing_lbl = tk.Label(footer, text="", bg=_BG, fg=_MUTED,
                                      font=("Segoe UI", 8))
@@ -311,6 +307,40 @@ class HUD:
         )
         self._use_btn.pack(side="left", expand=True, fill="x", ipady=6, padx=(3, 0))
 
+        # ── content (rolavel) ──
+        # As abas vivem dentro de um canvas com scroll: o painel cresce
+        # conforme features novas entram e nao cabe mais em altura fixa.
+        wrap = tk.Frame(self.win, bg=_BG)
+        wrap.pack(fill="both", expand=True, padx=10, pady=(6, 0))
+        canvas = tk.Canvas(wrap, bg=_BG, highlightthickness=0, bd=0)
+        vsb = tk.Scrollbar(wrap, orient="vertical", command=canvas.yview,
+                           width=10, bg=_PANEL, troughcolor=_BG, bd=0,
+                           relief="flat", activebackground=_ACCENT)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        content = tk.Frame(canvas, bg=_BG)
+        win_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _ajusta(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfigure(win_id, width=canvas.winfo_width())
+        content.bind("<Configure>", _ajusta)
+        canvas.bind("<Configure>", _ajusta)
+
+        def _roda(e):
+            canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        # bind_all pra roda funcionar em cima de qualquer widget filho
+        canvas.bind("<Enter>", lambda e: self.win.bind_all("<MouseWheel>", _roda))
+        canvas.bind("<Leave>", lambda e: self.win.unbind_all("<MouseWheel>"))
+        self._scroll_canvas = canvas
+
+        self._build_combate(self._make_tab(content, "COMBATE"))
+        self._build_pot(self._make_tab(content, "POT"))
+        self._build_buff(self._make_tab(content, "BUFF"))
+        self._build_drops(self._make_tab(content, "DROPS"))
+        self._build_res(self._make_tab(content, "RES"))
+
         # init
         self._switch_tab("COMBATE")
         self._highlight_active_profile()
@@ -328,13 +358,29 @@ class HUD:
         self._section_title(frame, "Combate")
         tk.Label(
             frame,
-            text="F1 = main/spam. F2-F4 disparam quando CD expira, depois retornam a F1.",
+            text="F1 = main/spam. F2-F4 disparam quando CD expira, depois retornam a F1.\n"
+                 "Ativacao: mouse = right-click repetido durante o cast |\n"
+                 "teclado = a propria tecla repetida.",
             bg=_BG, fg=_MUTED, font=("Segoe UI", 8),
             wraplength=290, justify="left",
         ).pack(anchor="w", pady=(0, 8))
 
         for fk in ("f1", "f2", "f3", "f4"):
             self._build_skill_row(frame, fk)
+
+        # Camera
+        tk.Frame(frame, bg="#2a2a2a", height=1).pack(fill="x", pady=(8, 6))
+        v_cam = tk.BooleanVar(value=bool(getattr(self._working, "cam_rotate", False)))
+        tk.Checkbutton(frame, text="girar camera pra direita", variable=v_cam,
+                       bg=_BG, fg=_FG, selectcolor=_PANEL,
+                       activebackground=_BG, activeforeground=_FG,
+                       font=("Segoe UI", 9), command=self._mark_dirty).pack(anchor="w")
+        tk.Label(frame, text="Toques na seta direita enquanto o bot roda —\n"
+                             "traz os mobs pro campo de mira das skills\n"
+                             "targetaveis. Pausa em pot critico e rebuff.",
+                 bg=_BG, fg=_MUTED, font=("Segoe UI", 8),
+                 wraplength=290, justify="left").pack(anchor="w", pady=(0, 2))
+        self._tk_vars["cam_rotate"] = v_cam
 
         # Autoclick (double-click de manutencao) — ACIMA do rebuff
         tk.Frame(frame, bg="#2a2a2a", height=1).pack(fill="x", pady=(8, 6))
@@ -404,6 +450,18 @@ class HUD:
             ent.bind("<KeyRelease>", lambda e: self._mark_dirty())
         self._cd_vars[fk] = v_cd
         self._tk_vars[f"skill_{fk}_cd"] = v_cd
+
+        # Como a skill e confirmada. Vale pra F1 tambem: no modo teclado o
+        # autoclick bate a propria F1 em vez de dar right-click.
+        if True:
+            v_md = tk.StringVar(
+                value=str(getattr(self._working, f"skill_{fk}_mode", "mouse")))
+            cmb = ttk.Combobox(row, textvariable=v_md,
+                               values=["mouse", "teclado"],
+                               state="readonly", width=8)
+            cmb.pack(side="right")
+            cmb.bind("<<ComboboxSelected>>", lambda e: self._mark_dirty())
+            self._tk_vars[f"skill_{fk}_mode"] = v_md
 
     # ── POT ───────────────────────────────────────────────────────────────
     def _build_pot(self, frame):
@@ -622,6 +680,11 @@ class HUD:
     # ── tab / profile switching ───────────────────────────────────────────
     def _switch_tab(self, tab):
         self._cur_tab = tab
+        if getattr(self, "_scroll_canvas", None) is not None:
+            try:
+                self._scroll_canvas.yview_moveto(0.0)
+            except Exception:
+                pass
         for name, frame in self._tab_frames.items():
             frame.pack_forget()
         self._tab_frames[tab].pack(fill="both", expand=True)

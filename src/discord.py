@@ -73,11 +73,20 @@ class Settings:
     skill_f3_cd: float = 15.0
     skill_f4:    bool  = False
     skill_f4_cd: float = 20.0
+    # Como a skill e ATIVADA durante a janela de cast:
+    #   "mouse"   -> right-click repetido (padrao do Priston)
+    #   "teclado" -> a propria F-key repetida
+    skill_f1_mode: str = "mouse"
+    skill_f2_mode: str = "mouse"
+    skill_f3_mode: str = "mouse"
+    skill_f4_mode: str = "mouse"
     rebuff_minutes:  int  = 7    # 5..10
     start_with_buff: bool = True
     # Intervalo do double-click (autoclick p/ manter o boneco batendo).
     # Opcoes: 1, 3, 7, 10, 12, 15s. Jitter escala com a base (micro em <=2s).
     autoclick_secs: int = 10
+    # CAMERA — gira a tela pra direita enquanto o bot roda (skills targetaveis)
+    cam_rotate: bool = False
     # POT
     pot_hp_pct: int = 40
     pot_sp_pct: int = 5
@@ -194,6 +203,7 @@ def _is_active() -> bool:
     """Callback pra HUD mostrar status do macro."""
     return state.active
 
+
 def _log(msg: str) -> None:
     try:
         data = (msg + "\n").encode("utf-8")
@@ -301,6 +311,21 @@ _SYNC_PAUSE    = 2.0
 # Rebuff Wartale: em vez de um double-click unico por skill, o right-click
 # pipoca durante toda a janela de cast. Taxa sorteada a cada clique (nunca
 # cadencia fixa — periodo constante e exatamente o que WarningAutoMouse pega).
+# Rebuff cede a vez pra pot de vida. _HOLD = quanto o ciclo espera depois de
+# uma pocao (a barra demora a refletir a cura); _WAIT = teto da espera antes de
+# desistir do ciclo, pra nunca travar o rebuff pra sempre.
+_SYNC_HP_HOLD = 1.5
+_SYNC_HP_WAIT = 25.0
+# Vida exigida pra castar buff. NAO e o limiar da pot (40%): durante o rebuff o
+# personagem para de atacar por ~8s e come mais pancada, e a medicao de 1118
+# quedas mostrou p99=52% e maxima=72% — de 40% uma pancada dessas mata antes de
+# qualquer pocao chegar (foi o que aconteceu: 63% -> 0% entre duas leituras).
+# Com 80% nenhuma queda observada zeraria a vida.
+_SYNC_HP_SAFE = 80
+# Piso absoluto: se a vida nao alcancar SAFE dentro de _SYNC_HP_WAIT mas estiver
+# acima disso, casta assim mesmo — ficar sem buff tambem mata.
+_SYNC_HP_MIN  = 55
+
 _SYNC_SPAM_HZ_LO = 5.0
 _SYNC_SPAM_HZ_HI = 8.0
 
@@ -370,6 +395,13 @@ _POT_REACT_HI   = 0.120
 # Debounce por slot (gaussiano ~300ms): apos beber, espera a barra refletir a
 # cura na tela antes de poder beber o MESMO slot de novo — evita pot dupla.
 # Nao e o "delay" antigo (refresh/GetPixel): e so anti-duplo + cadencia humana.
+# Pontos ACIMA do limiar em que o loop ja acelera. Dimensionado pelo log: a
+# queda de HP entre leituras tem p90 de 24% e p99 de 36%, entao a partir de
+# ~40 pontos acima do limiar a proxima pancada ja pode cruzar.
+_POT_WATCH_BAND = 40
+# No ritmo acelerado, SP/MP sao lidos so 1 a cada N ticks (nao matam ninguem).
+_POT_AUX_EVERY  = 4
+
 _POT_CD_MEAN = 0.30
 _POT_CD_STD  = 0.07
 _POT_CD_LO   = 0.20
@@ -396,6 +428,16 @@ _MOVE_FINE_MAX    = 14     # teto do passo fino quando a curva engole o delta
 _MOVE_MAX_ITERS   = 30     # iteracoes totais (aproximacao + fino)
 _MOVE_MAX_STALL   = 3      # iteracoes sem deslocamento antes de desistir
 _MOVE_ACCEPT      = 6      # px: erro final ainda aceito (slot e bem maior)
+
+# Vigia da janela do jogo. Se o Wartale fechar, o macro se desliga sozinho.
+# A tolerancia existe porque a janela some por instantes legitimos — troca de
+# mapa, mudanca de resolucao, alt-enter. So desliga apos _WATCH_MISSES leituras
+# seguidas sem achar nada.
+_WATCH_PERIOD = 2.0
+_WATCH_MISSES = 3
+
+# Rotacao de camera: seta direita PRESA, giro continuo.
+_CAM_POLL = 0.08     # com que frequencia reavalia se pode continuar segurando
 
 _AUX_CD      = 10.0   # fixed game cooldown (seconds)
 _AUX_JIT_LO  = 2.0    # human jitter range after cooldown
@@ -616,10 +658,21 @@ _load_resolutions()   # funde profiles custom de resolutions.json sobre os built
 # Conferido contra os assets: com s>=130 a stamina mantem 4 de 8 px em TODAS as
 # 76 linhas (threshold de linha = 1) e grupo contiguo de 4 colunas (janela
 # aceita 3..14). V fica logo abaixo do minimo do asset (78/86/91).
+# O 7o campo e o piso de saturacao do FILL, separado do usado pra LOCALIZAR a
+# barra. Sao trabalhos diferentes: achar onde a barra esta tolera cor frouxa,
+# mas distinguir cheio de vazio precisa ser rigoroso.
+#
+# O HP e o caso critico. O soquete vazio dele nao e escuro: e um marrom
+# AVERMELHADO com hue 5-8, e a janela de hue do fill termina em 4 — margem de
+# 1 a 4 graus, que qualquer variacao de luz atravessa, e ai vazio conta como
+# cheio e o pot nao dispara. Medido na tela: fill s=249..253, soquete s=75..110.
+# Piso em 150 fica no meio dessa lacuna de 140 pontos.
+# MP nao sofre disso (azul puro contra fundo escuro) e o SP ja tinha sido
+# resolvido pelo mesmo caminho.
 _WAR_BARS = {
-    'a': (16, 94, 176,   4,  60, 62),  # HP  — vermelho, hue cruza o zero
-    'b': ( 8, 76,  26,  56, 130, 68),  # SP  — verde-amarelado
-    'c': (16, 94, 112, 128,  55, 72),  # MP  — azul
+    'a': (16, 94, 176,   4,  60, 62, 150),  # HP  — vermelho, hue cruza o zero
+    'b': ( 8, 76,  26,  56, 130, 68, 130),  # SP  — verde-amarelado
+    'c': (16, 94, 112, 128,  55, 72, 130),  # MP  — azul
 }
 # Linha conta como "cheia" se >=25% dos pixels baterem (o sheen branco vertical
 # da stamina come ate 2 dos 8 px; pior caso medido no asset foi 6/8).
@@ -634,6 +687,7 @@ _WAR_BOT_RUN   = 2
 # Deteccao do x da barra por altura de coluna (_war_candidates).
 _WAR_XMIN_ROWS  = 12    # linhas contiguas na vertical pra a coluna ser candidata
 _WAR_XLOCK_ROWS = 25    # confianca pra TRAVAR o x: acima disso e barra, nao ruido
+_WAR_GAP_MAX    = 2     # colunas de brilho toleradas dentro do grupo
 _WAR_BASE_TOL   = 4     # px de folga na baseline compartilhada pelas 3 barras
 
 # Diagnostico das barras (_war_diag). Desligar quando a leitura estiver ok —
@@ -665,6 +719,13 @@ class State:
     # de posicao, SHIFT segurado). NENHUMA outra thread pode mandar tecla ou
     # click — um '1' solto durante o SHIFT vira SHIFT+1 e mexe item na mochila.
     repotting: bool = False
+    # Vida abaixo do limiar AGORA e instante da ultima pot de vida. O rebuff
+    # usa os dois pra se segurar: ficar 8s parado castando skill com a vida
+    # caindo era o que matava o personagem.
+    hp_low: bool = False
+    hp_pct: int = -1          # ultima leitura (-1 = desconhecida)
+    hp_slot_empty: bool = False
+    last_hp_pot: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def paused_by_user(self) -> bool:
@@ -903,7 +964,106 @@ def _human_click(ic, double: bool = False, right: bool = False) -> None:
     ic.send_mouse_click(double=double, right=right)
 
 
-def _spam_right_click(ic, duration: float) -> int:
+def _pot_hp_rebuff() -> None:
+    """Bebe uma pocao de vida entre as skills do rebuff.
+
+    A janela do rebuff e o momento mais exposto do ciclo: o personagem para de
+    atacar e fica parado castando. Uma pocao por skill mantem a vida no teto
+    durante essa janela, em vez de depender de reagir a uma queda que pode ser
+    mais rapida que o loop.
+
+    NAO mexe em state.last_hp_pot de proposito: aquele campo segura o rebuff
+    por 1.5s e e pra emergencia. Marcar aqui faria o ciclo pausar depois de
+    cada skill sem necessidade.
+    """
+    if _ic is None or state.stop:
+        return
+    if state.hp_slot_empty:
+        _log("[SYNC] pot entre skills pulada — slot de vida vazio")
+        return
+    time.sleep(random.uniform(0.05, 0.12))
+    _ic.send_key('1', hold_sec=random.uniform(0.02, 0.04))
+    _log(f"[SYNC] pot de vida entre skills (hp={state.hp_pct}%)")
+
+
+def _spam_key(ic, key: str, duration: float, abortar=None) -> int:
+    """Martela uma tecla por `duration` segundos.
+
+    Serve pras skills configuradas como "teclado": em vez de confirmar o cast
+    com right-click, a propria F-key e repetida durante a janela. Mesma
+    cadencia sorteada do spam de mouse, pra nao virar periodo fixo.
+    """
+    if ic is None or duration <= 0:
+        return 0
+    deadline = time.monotonic() + duration
+    n = 0
+    while time.monotonic() < deadline and not state.stop:
+        if abortar is not None and abortar():
+            break
+        t0 = time.monotonic()
+        ic.send_key(key, hold_sec=random.uniform(0.02, 0.05))
+        n += 1
+        hz = random.uniform(_SYNC_SPAM_HZ_LO, _SYNC_SPAM_HZ_HI)
+        gap = (1.0 / hz) - (time.monotonic() - t0)
+        if gap > 0:
+            time.sleep(max(0.01, random.gauss(gap, gap * 0.20)))
+    return n
+
+
+def _f1_teclado() -> bool:
+    return str(getattr(_settings, "skill_f1_mode", "mouse")).lower() == "teclado"
+
+
+def _confirma_principal(ic) -> None:
+    """Mantem a skill principal batendo, no modo configurado.
+
+    mouse   -> double right-click (o autoclick nativo do jogo)
+    teclado -> a propria F1 batida duas vezes, com intervalo humano
+    """
+    if ic is None:
+        return
+    if _f1_teclado():
+        ic.send_key('f1', hold_sec=_human_hold(0.03, 0.07))
+        time.sleep(random.uniform(0.05, 0.12))
+        ic.send_key('f1', hold_sec=_human_hold(0.03, 0.07))
+    else:
+        _human_click(ic, double=True, right=True)
+
+
+def _hp_emergencia() -> bool:
+    """Vida abaixo do limiar, ou pot de vida usada ha pouco.
+
+    A segunda condicao existe porque a barra demora a refletir a cura: sem ela
+    o rebuff voltaria a castar no mesmo instante em que a pocao foi bebida,
+    justamente quando o personagem ainda esta em perigo.
+    """
+    if (time.monotonic() - state.last_hp_pot) < _SYNC_HP_HOLD:
+        return True
+    if state.hp_pct < 0:            # leitura indisponivel: nao trava o rebuff
+        return state.hp_low
+    return state.hp_pct < _SYNC_HP_SAFE
+
+
+def _esperar_hp(limite: float = _SYNC_HP_WAIT) -> bool:
+    """Segura o rebuff enquanto a vida nao estabiliza. True se estabilizou.
+
+    Nao dispara pot: quem cura e o probe loop, que nunca foi bloqueado pelo
+    sync. Aqui so se sai da frente — parar o spam libera a serial e o
+    personagem volta a poder agir.
+    """
+    fim = time.monotonic() + limite
+    while not state.stop and time.monotonic() < fim:
+        if not _hp_emergencia():
+            return True
+        time.sleep(0.05)
+    # Estourou o tempo: segue se a vida ao menos passou do piso.
+    ok = state.hp_pct >= _SYNC_HP_MIN
+    _log(f"[SYNC] espera de vida esgotada em {state.hp_pct}% — "
+         f"{'seguindo' if ok else 'abortando'}")
+    return ok
+
+
+def _spam_right_click(ic, duration: float, abortar=None) -> int:
     """Martela right-click por `duration` segundos (Wartale rebuff).
     Retorna quantos cliques sairam (log).
 
@@ -917,6 +1077,8 @@ def _spam_right_click(ic, duration: float) -> int:
     deadline = time.monotonic() + duration
     n = 0
     while time.monotonic() < deadline and not state.stop:
+        if abortar is not None and abortar():
+            break
         t0 = time.monotonic()
         ic.send_mouse_click(right=True)
         n += 1
@@ -1030,7 +1192,6 @@ def _query_viewport(hwnd: int) -> tuple[int, int, int, int] | None:
     return w, h, pt.x, pt.y
 
 
-
 def _to_screen(rx: float, ry: float, w: int, h: int, ox: int, oy: int) -> tuple[int, int]:
     return (ox + int(rx * w), oy + int(ry * h))
 
@@ -1081,7 +1242,6 @@ def _thresh_px(screen_x: int, bar_r: tuple, thr: float, h: int, oy: int) -> tupl
     return screen_x, oy + int((ry_bot - thr * (ry_bot - ry_top)) * h)
 
 
-
 def _nn_scale(src, sw: int, sh: int, sc: int, dw: int, dh: int) -> bytearray:
     """Nearest-neighbor scale src (sw×sh, sc channels) → dw×dh."""
     out = bytearray(dw * dh * sc)
@@ -1116,8 +1276,6 @@ def _capture_region(hdc_src, sx: int, sy: int, cw: int, ch: int):
     gdi32.DeleteObject(bmp)
     gdi32.DeleteDC(hdc_m)
     return bytearray(buf)
-
-
 
 
 def _sad_center(cap_bgrx, cw: int, ch: int,
@@ -1242,14 +1400,20 @@ def _buff_learn(bid: str, key: str, ox: int, oy: int) -> bool:
     antes = _buff_snapshot(ox, oy)
     if antes is None or not (_ic and _can_tick()):
         return False
-    _ic.send_key(key, hold_sec=_human_hold())
-    time.sleep(random.uniform(0.12, 0.22))
-    _human_click(_ic, double=False, right=True)
-    time.sleep(max(_BUFF_CAST_WAIT, random.gauss(_BUFF_CAST_WAIT, 0.2)))
-    depois = _buff_snapshot(ox, oy)
-    # Volta pro F1 SEMPRE, mesmo se a leitura falhar — o personagem nao pode
-    # ficar com o buff na mao.
-    _buff_back_to_main()
+    state.syncing = True
+    orig = _park_mouse()
+    try:
+        _ic.send_key(key, hold_sec=_human_hold())
+        time.sleep(random.uniform(0.12, 0.22))
+        _human_click(_ic, double=False, right=True)
+        time.sleep(max(_BUFF_CAST_WAIT, random.gauss(_BUFF_CAST_WAIT, 0.2)))
+        depois = _buff_snapshot(ox, oy)
+    finally:
+        # F1 e cursor voltam AINDA sob a protecao do syncing: se aux_loop
+        # pudesse entrar aqui, mandaria skill com o buff ainda na mao.
+        _buff_back_to_main()
+        _unpark_mouse(orig)
+        state.syncing = False
     if depois is None:
         return False
 
@@ -1336,11 +1500,13 @@ def _bar_pct(hdc_src, bar_x: int, bar_r: tuple, h: int, oy: int,
     return (matched * 100) // total
 
 
-def _war_px(spec: tuple, r: int, g: int, b: int) -> bool:
+def _war_px(spec: tuple, r: int, g: int, b: int, estrito: bool = False) -> bool:
     """Pixel bate com a cor de fill da barra? Fonte unica de verdade — usada
     tanto pelo scan de x (_scan_hud) quanto pela contagem de linhas.
     Integer-only (portavel pro MCU)."""
-    _bw, _bh, h_lo, h_hi, s_min, v_min = spec
+    _bw, _bh, h_lo, h_hi, s_min, v_min = spec[:6]
+    if estrito and len(spec) > 6:
+        s_min = spec[6]
     hh, ss, vv = _pixel_to_color_space(r, g, b)
     if vv < v_min or ss < s_min:
         return False
@@ -1353,7 +1519,7 @@ def _war_hits(cap, off: int, bw: int, spec: tuple) -> int:
     n = 0
     for x in range(bw):
         o = off + x * 4
-        if _war_px(spec, cap[o+2], cap[o+1], cap[o]):
+        if _war_px(spec, cap[o+2], cap[o+1], cap[o], estrito=True):
             n += 1
     return n
 
@@ -1390,6 +1556,25 @@ def _war_candidates(cap, bw: int, band_h: int, x_lo_abs: int,
         vrun[x]  = best_v
         vlast[x] = last
 
+    # Agrupa colunas altas TOLERANDO buracos estreitos. A barra tem uma coluna
+    # de brilho no meio que despenca abaixo do minimo (visto no log da HP:
+    # cols=[6,56,56,56,56,8,56,56,...] — o 8 no meio de 56s). Sem tolerancia o
+    # grupo se parte em dois, a largura sai errada (13 em vez de 18), a
+    # confianca nunca chega no minimo pra travar, e a barra fica redetectando
+    # ate agarrar lixo — foi assim que o x da HP pulou de 879 pra 769 e a
+    # leitura zerou com o personagem vivo.
+    def _bom(i: int) -> bool:
+        if vrun[i] >= _WAR_XMIN_ROWS:
+            return True
+        # buraco de ate _WAR_GAP_MAX colunas com vizinhos altos dos dois lados
+        for g in range(1, _WAR_GAP_MAX + 1):
+            e = i - 1
+            d = i + g
+            if e >= 0 and d < bw and vrun[e] >= _WAR_XMIN_ROWS and vrun[d] >= _WAR_XMIN_ROWS:
+                if all(vrun[k] < _WAR_XMIN_ROWS for k in range(i, d)):
+                    return True
+        return False
+
     out = []
     x = 0
     while x < bw:
@@ -1397,13 +1582,67 @@ def _war_candidates(cap, bw: int, band_h: int, x_lo_abs: int,
             x += 1
             continue
         start = x
-        while x < bw and vrun[x] >= _WAR_XMIN_ROWS:
+        while x < bw and _bom(x):
             x += 1
         width = x - start
-        if want - 5 <= width <= want + 6:
-            out.append((x_lo_abs + start, min(vrun[start:x]),
-                        max(vlast[start:x]), width))
+        if want - 5 <= width <= want + 8:
+            # confianca ignora as colunas do buraco, senao o brilho derruba o
+            # minimo do grupo inteiro
+            alturas = [vrun[k] for k in range(start, x) if vrun[k] >= _WAR_XMIN_ROWS]
+            if alturas:
+                out.append((x_lo_abs + start, min(alturas),
+                            max(vlast[start:x]), width))
     return out
+
+
+# Ponto neutro no meio da HUD (entre os dois orbes), preenchido pelo probe loop
+# a partir da geometria ja detectada das barras. Outras threads so leem.
+_g_hud_center: tuple | None = None
+_HUD_CENTER_DY = 70      # px acima da base das barras — vao escuro acima dos orbes
+
+
+def _hud_center(ox: int, oy: int, w: int, h: int,
+                xs: list, ws: list, bottoms: list) -> tuple:
+    """Meio da HUD: ponto entre os orbes, seguro pra soltar o right-click do
+    rebuff. Derivado das barras ja localizadas (extremo esquerdo da mais a
+    esquerda ate o direito da mais a direita), entao nao precisa de mapeamento
+    novo. Cai no ratio central da janela se nenhuma barra foi localizada."""
+    achadas = [(xs[i], ws[i]) for i in range(3) if xs[i] and ws[i]]
+    if achadas:
+        esq = min(x for x, _ in achadas)
+        dire = max(x + wd for x, wd in achadas)
+        cx = (esq + dire) // 2
+    else:
+        cx = ox + w // 2
+    bots = [b for b in bottoms if b]
+    base = max(bots) if bots else oy + int(h * 0.99)
+    return (cx, base - _HUD_CENTER_DY)
+
+
+def _park_mouse():
+    """Leva o cursor pro meio da HUD antes de castar buff e devolve a posicao
+    original pra quem chamou restaurar depois.
+
+    Motivo: o rebuff solta um right-click depois da tecla. Com o cursor sobre
+    um monstro isso vira ataque/movimento em vez de buff. Sobre a HUD o clique
+    e inofensivo.
+    """
+    if _ic is None or _g_hud_center is None:
+        return None
+    orig = _cursor_pos()
+    cx, cy = _g_hud_center
+    # Pixel exato, sem jitter (pedido do usuario). O clique em si ainda varia:
+    # send_mouse_click aplica tremor de +-2px antes de apertar, entao o ponto
+    # clicado nao fica literalmente fixo.
+    _move_cursor_to(_ic, cx, cy)
+    return orig
+
+
+def _unpark_mouse(orig) -> None:
+    """Devolve o cursor pra onde estava antes do rebuff."""
+    if orig is None or _ic is None:
+        return
+    _move_cursor_to(_ic, orig[0], orig[1])
 
 
 def _war_scan_bars(hdc_src, w: int, h: int, ox: int, oy: int) -> tuple:
@@ -1742,8 +1981,6 @@ def _emit_ping(kind: str) -> None:
     threading.Thread(target=_seq, daemon=True, name=_tname()).start()
 
 
-
-
 def _decode_tmpl(d_hex: str, w: int, h: int, ch: int):
     return bytes(b ^ _K for b in bytes.fromhex(d_hex)), w, h, ch
 
@@ -1788,7 +2025,6 @@ def _init_templates() -> None:
     _g_tmpl_sc = _decode_tmpl(_TMPL_SC_D, _TMPL_SC_W, _TMPL_SC_H, _TMPL_SC_C)
     _g_tmpl_sr = _decode_tmpl(_TMPL_SR_D, _TMPL_SR_W, _TMPL_SR_H, _TMPL_SR_C)
     _log('[SVC] templates ok')
-
 
 
 _ic: ArduinoHID | None = None
@@ -1851,7 +2087,7 @@ def _idle_tick() -> None:
             continue
 
         if _ic and _can_tick():
-            _human_click(_ic, double=True, right=True)
+            _confirma_principal(_ic)
 
 
 def _run_sync() -> None:
@@ -1862,48 +2098,74 @@ def _run_sync() -> None:
 
     # Repot em andamento (inventario aberto / SHIFT segurado): espera terminar
     # antes de tomar a serial. Teto de 20s pra nunca travar o rebuff.
+    # Espera repot OU recast individual do monitor terminar antes de tomar a
+    # serial — dois casts simultaneos se atrapalhariam. Teto pra nunca travar.
     _wait_deadline = time.monotonic() + 20.0
-    while state.repotting and not state.stop and time.monotonic() < _wait_deadline:
+    while ((state.repotting or state.syncing) and not state.stop
+           and time.monotonic() < _wait_deadline):
         time.sleep(0.1)
 
     state.syncing = True
     _log("[SYNC] start")
+    # Cursor vai pro meio da HUD durante TODO o ciclo: o right-click que
+    # confirma cada skill nao pode cair sobre monstro, senao vira ataque.
+    _mouse_orig = _park_mouse()
     # Wartale: cada skill do rebuff so entra com o right-click martelando a
     # janela de cast inteira. PT EU segue no double-click unico + espera.
     _war = _GAME == "wartale"
+    _passo_atual = ['']      # qual key esta na janela de cast agora
 
     def _cast_window(secs: float) -> None:
         """Consome `secs` segundos confirmando o cast: spam no Wartale,
-        double-click + espera no PT EU. O tempo total gasto e o mesmo nos
-        dois caminhos — a cadencia do rebuff nao muda."""
-        if _war:
-            n = _spam_right_click(_ic, secs)
+        double-click + espera no PT EU. Aborta na hora se a vida cair — o spam
+        segura a serial, e segurar a serial atrasa a pot."""
+        if _war and _f1_teclado() and _passo_atual[0] == 'f1':
+            n = _spam_key(_ic, 'f1', secs, abortar=_hp_emergencia)
+            _log(f"[SYNC] cast window {secs:.2f}s — {n} teclas f1")
+        elif _war:
+            n = _spam_right_click(_ic, secs, abortar=_hp_emergencia)
             _log(f"[SYNC] cast window {secs:.2f}s — {n} rclicks")
         else:
             _human_click(_ic, double=True, right=True)
-            time.sleep(secs)
+            fim = time.monotonic() + secs
+            while time.monotonic() < fim and not state.stop:
+                if _hp_emergencia():
+                    return
+                time.sleep(0.02)
 
     try:
-        _ic.send_key('f5', hold_sec=random.uniform(0.08, 0.15))
-        time.sleep(random.uniform(0.08, 0.15))
-        _cast_window(max(0.6, random.gauss(_SYNC_PAUSE, 0.15)))
+        # O rebuff e uma SEQUENCIA RETOMAVEL. Antes era um bloco corrido de ~8s
+        # em que o personagem parava de atacar e so castava — com a vida caindo,
+        # ele morria no meio. Agora, antes de cada passo, o ciclo espera a vida
+        # voltar; a pot roda no probe loop, que nunca foi bloqueado pelo sync.
+        # Ao voltar, retoma do passo em que estava em vez de recomecar.
+        passos = [('f5', lambda: max(0.6, random.gauss(_SYNC_PAUSE, 0.15)))]
+        for _k in ('f6', 'f7', 'f8'):
+            passos.append((_k, lambda: random.uniform(1.0, 1.3)))
+        passos.append(('f1', lambda: (random.uniform(0.45, 0.80) if _war else 0.0)))
 
-        for key in ('f6', 'f7', 'f8'):
-            if state.stop:
-                break
+        i = 0
+        while i < len(passos) and not state.stop:
+            if _hp_emergencia():
+                if not _esperar_hp():
+                    _log(f"[SYNC] abortado no passo {i+1}/{len(passos)} — vida nao estabilizou")
+                    break
+                _log(f"[SYNC] retomando do passo {i+1}/{len(passos)}")
+
+            key, janela = passos[i]
+            _passo_atual[0] = key
+            if key == 'f1':
+                time.sleep(random.uniform(1.0, 1.3))
             _ic.send_key(key, hold_sec=random.uniform(0.08, 0.15))
             time.sleep(random.uniform(0.08, 0.15))
-            # 1s entre cada skill — dá tempo do rebuff passar sem erro
-            _cast_window(random.uniform(1.0, 1.3))
-
-        if not state.stop:
-            time.sleep(random.uniform(1.0, 1.3))
-            _ic.send_key('f1', hold_sec=random.uniform(0.08, 0.12))
-            time.sleep(random.uniform(0.15, 0.3))
-            _cast_window(random.uniform(0.45, 0.80) if _war else 0.0)
-
+            _cast_window(janela())
+            # Uma pocao de vida por skill rebuffada.
+            _pot_hp_rebuff()
+            i += 1
 
     finally:
+        # Devolve o cursor mesmo se o ciclo abortou no meio.
+        _unpark_mouse(_mouse_orig)
         state.syncing = False
         _log("[SYNC] done")
 
@@ -1987,13 +2249,23 @@ def _buff_monitor() -> None:
                 key = getattr(_settings, f"buff_{b}_key", "f5")
                 _log(f"[BUF] {_BUFF_LABELS.get(b, b)} ausente "
                      f"({faltas[b]} varreduras) — recast {key}")
-                _ic.send_key(key, hold_sec=_human_hold())
-                time.sleep(random.uniform(0.12, 0.22))
-                _human_click(_ic, double=False, right=True)
-                last_recast[b] = time.monotonic()
-                faltas[b] = 0
-                time.sleep(max(_BUFF_CAST_WAIT, random.gauss(_BUFF_CAST_WAIT, 0.2)))
-                _buff_back_to_main()
+                # Buff tem prioridade so atras da pot: enquanto casta, nenhum
+                # ciclo de skill pode rodar. state.syncing e o que _can_tick()
+                # ja consulta, entao levantar aqui para idle_tick e aux_loop.
+                state.syncing = True
+                orig = _park_mouse()
+                try:
+                    _ic.send_key(key, hold_sec=_human_hold())
+                    time.sleep(random.uniform(0.12, 0.22))
+                    _human_click(_ic, double=False, right=True)
+                    last_recast[b] = time.monotonic()
+                    faltas[b] = 0
+                    time.sleep(max(_BUFF_CAST_WAIT,
+                                   random.gauss(_BUFF_CAST_WAIT, 0.2)))
+                    _buff_back_to_main()
+                finally:
+                    _unpark_mouse(orig)
+                    state.syncing = False
         except Exception as e:
             _log(f"[ERR] buff_monitor: {type(e).__name__}: {e}")
 
@@ -2112,6 +2384,7 @@ def _repot_slot(slot_idx: int) -> bool:
 
 
 def _probe_loop() -> None:
+    global _g_hud_center
     try:
         last_pot          = {'1': 0.0, '2': 0.0, '3': 0.0}  # debounce por slot
         empty_since       = [0.0, 0.0, 0.0]  # monotonic em que o slot ficou vazio
@@ -2122,6 +2395,7 @@ def _probe_loop() -> None:
         _bar_xs           = None
         _war_xs           = [None, None, None]   # x de cada barra (Wartale)
         _war_ws           = [0, 0, 0]            # largura detectada de cada barra
+        _war_conf         = [0, 0, 0]            # confianca da geometria atual
         _war_locked       = [False, False, False]  # x ja confirmado por coluna alta
         _war_bottoms      = [None, None, None]   # base de cada barra (Wartale)
         _war_bot_locked   = [False, False, False]
@@ -2131,6 +2405,8 @@ def _probe_loop() -> None:
         _slot_empty_tmpl  = [None, None, None]
         _next_refresh     = 0.0
         _dbg_tick         = 0
+        _rapido           = False     # loop acelerado (perto do limiar)
+        _sp_ant = _mp_ant = -1        # ultimo SP/MP lidos (cache do modo rapido)
 
         while not state.stop:
             if not _can_probe():
@@ -2158,18 +2434,27 @@ def _probe_loop() -> None:
                             _war_dims_key   = (w, h, ox, oy)
                             _war_xs         = [None, None, None]
                             _war_ws         = [0, 0, 0]
+                            _war_conf       = [0, 0, 0]
                             _war_bottoms    = [None, None, None]
                             _war_locked     = [False, False, False]
                             _war_bot_locked = [False, False, False]
-                        # x vem da imagem e e TRAVADO na primeira deteccao de
-                        # alta confianca (coluna alta = barra de verdade). Sem
-                        # travar, um refresh que pegasse ruido reescrevia um x
-                        # bom por um ruim — no log o sp oscilava 863/1012/1182
-                        # enquanto hp e mp, de cor rara na HUD, ficavam firmes.
+                        # x vem da imagem, so MELHORA e depois TRAVA.
+                        #
+                        # Antes qualquer deteccao sobrescrevia a anterior. Com a
+                        # barra baixa a confianca nao alcancava o minimo pra
+                        # travar, entao ela seguia redetectando — e num ciclo
+                        # agarrou ruido: o x da HP pulou de 879 (conf 56) pra
+                        # 769 com coluna vazia, e a leitura zerou com o
+                        # personagem vivo, sem pot. Agora uma geometria so cede
+                        # lugar a outra de confianca MAIOR, entao lixo fraco
+                        # nunca derruba uma leitura que estava funcionando.
                         found = _war_scan_bars(hdc_s, w, h, ox, oy)
                         for _i, _v in enumerate(found):
                             if _v is None or _war_locked[_i]:
                                 continue
+                            if _v[1] <= _war_conf[_i]:
+                                continue
+                            _war_conf[_i] = _v[1]
                             _war_xs[_i] = _v[0]
                             _war_ws[_i] = _v[2]
                             if _v[1] >= _WAR_XLOCK_ROWS:
@@ -2208,6 +2493,8 @@ def _probe_loop() -> None:
                             for _bi in range(3):
                                 if _war_bottoms[_bi] is None:
                                     _war_bottoms[_bi] = _base
+                        _g_hud_center = _hud_center(ox, oy, w, h, _war_xs,
+                                                    _war_ws, _war_bottoms)
                         _log(f"[MON] war xs={_war_xs} bottoms={_war_bottoms} "
                              f"(hint={y_hint} max={y_max})")
                     s1_pos = _to_screen(*_PA_R, w, h, ox, oy)
@@ -2260,9 +2547,18 @@ def _probe_loop() -> None:
                             return -1
                         return _war_bar_pct(hdc, bx, _war_ws[i], bot,
                                             _WAR_BARS[code])
+                    # HP e lido SEMPRE. SP/MP so a cada _POT_AUX_EVERY ticks
+                    # quando o loop esta acelerado: ler as tres custa ~17ms e
+                    # so a vida mata, entao gastar esse tempo com as outras
+                    # duas atrasa justamente a leitura critica. No ritmo
+                    # ocioso (50ms) le as tres, como antes.
                     hp_pct = _war_read(0, hp_x, 'a')
-                    sp_pct = _war_read(1, sp_x, 'b')
-                    mp_pct = _war_read(2, mp_x, 'c')
+                    if _rapido and (_dbg_tick % _POT_AUX_EVERY):
+                        sp_pct, mp_pct = _sp_ant, _mp_ant
+                    else:
+                        sp_pct = _war_read(1, sp_x, 'b')
+                        mp_pct = _war_read(2, mp_x, 'c')
+                    _sp_ant, _mp_ant = sp_pct, mp_pct
                     # Diagnostico periodico das 3 barras. HP e MP entram como
                     # controle: eles ja potam certo, entao o mapa deles mostra
                     # como e um mapa saudavel pra comparar com o da stamina.
@@ -2323,21 +2619,38 @@ def _probe_loop() -> None:
                     return
                 # Debounce por slot: nao re-bebe o mesmo slot ate a barra ter
                 # tempo de refletir a cura (evita pot dupla). Gauss ~300ms.
-                cd = max(_POT_CD_LO, min(_POT_CD_HI,
-                                         random.gauss(_POT_CD_MEAN, _POT_CD_STD)))
+                #
+                # Encolhe com a gravidade: se a vida CONTINUA caindo depois da
+                # primeira pocao, esperar 450ms pela segunda e o que mata. No
+                # limiar mantem os ~300ms (evita desperdicio); perto do zero
+                # cai pro piso. Continua gaussiano.
+                sev_cd = 0.0 if thr <= 0 else max(0.0, min(1.0, (thr - pct) / float(thr)))
+                cd_mean = _POT_CD_MEAN - sev_cd * (_POT_CD_MEAN - _POT_CD_LO)
+                cd = max(_POT_CD_LO * (1.0 - 0.4 * sev_cd),
+                         min(_POT_CD_HI, random.gauss(cd_mean, _POT_CD_STD)))
                 if time.monotonic() - last_pot_d[key] < cd:
                     return
                 if not (_ic and _can_probe()):
                     return
                 try:
-                    # micro-reacao humana gaussiana antes de apertar — quebra o
+                    # Micro-reacao humana gaussiana antes de apertar — quebra o
                     # padrao de reacao instantanea/identica do macro.
+                    #
+                    # A media escala com a GRAVIDADE: no limiar usa a reacao
+                    # cheia; quanto mais fundo abaixo dele, mais rapida, ate o
+                    # piso. Isso corta latencia justamente quando ela mata, e
+                    # continua humano — gente reage mais rapido a susto maior.
+                    # A gaussiana permanece, entao nao vira tempo fixo.
+                    sev  = 0.0 if thr <= 0 else max(0.0, min(1.0, (thr - pct) / float(thr)))
+                    mean = _POT_REACT_MEAN - sev * (_POT_REACT_MEAN - _POT_REACT_LO)
                     react = max(_POT_REACT_LO,
                                 min(_POT_REACT_HI,
-                                    random.gauss(_POT_REACT_MEAN, _POT_REACT_STD)))
+                                    random.gauss(mean, _POT_REACT_STD * (1.0 - 0.5 * sev))))
                     time.sleep(react)
                     _ic.send_key(key, hold_sec=random.uniform(0.02, 0.04))
                     last_pot_d[key] = time.monotonic()
+                    if key == '1':
+                        state.last_hp_pot = last_pot_d[key]
                     critical = pct <= max(1, thr // 2)
                     tag = "CRIT" if critical else "FIRED"
                     _log(f"[POT] {label} {tag} pct={pct}% thr={thr}% react={react*1000:.0f}ms")
@@ -2396,6 +2709,9 @@ def _probe_loop() -> None:
                 return 0 <= pct < thr
 
             hp_low = _low(hp_pct, _settings.pot_hp_pct)
+            state.hp_low = hp_low
+            state.hp_pct = hp_pct
+            state.hp_slot_empty = _empty(_slot_empty_tmpl[0], s1_c)
             state.hp_critical = hp_low and hp_pct <= max(1, _settings.pot_hp_pct // 2)
 
             if hp_low:
@@ -2411,10 +2727,33 @@ def _probe_loop() -> None:
             # Tick rate adaptativo: quase 0 (5ms) enquanto algum pct esta baixo —
             # mata o delay entre uma pot e a proxima; 50ms ocioso (detecta queda
             # rapido) quando tudo OK, ainda economico de CPU.
+            # Cadencia adaptativa em TRES niveis, nao dois.
+            #
+            # Antes era 5ms com alguma barra baixa e 50ms com tudo ok. O
+            # problema esta na transicao: a barra cruza o limiar DENTRO de um
+            # sleep de 50ms, entao a deteccao ja nasce ate 50ms atrasada — e
+            # como ler as 3 barras custa ~17ms, o ciclo ocioso era de 67ms.
+            # Agora, quando a vida chega perto do limiar (_POT_WATCH_BAND
+            # pontos acima), o loop ja acelera; assim o cruzamento e visto
+            # quase na hora em vez de depois de um ciclo inteiro.
+            margem = 99
+            if hp_pct >= 0:
+                margem = min(margem, hp_pct - _settings.pot_hp_pct)
+            if sp_pct >= 0:
+                margem = min(margem, sp_pct - _settings.pot_sp_pct)
+            if mp_pct >= 0:
+                margem = min(margem, mp_pct - _settings.pot_mp_pct)
+
             any_low = (hp_low or
                        _low(sp_pct, _settings.pot_sp_pct) or
                        _low(mp_pct, _settings.pot_mp_pct))
-            time.sleep(0.005 if any_low else 0.05)
+            _rapido = any_low or margem <= _POT_WATCH_BAND
+            if any_low:
+                time.sleep(0.002)
+            elif _rapido:
+                time.sleep(0.004)
+            else:
+                time.sleep(0.05)
 
     except Exception:
         import traceback
@@ -2487,9 +2826,19 @@ def _aux_loop() -> None:
             if state.hp_critical:
                 break
 
+            modo = str(getattr(_settings, f"skill_{key}_mode", "mouse")).lower()
+            janela = max(1.0, random.gauss(1.2, 0.2))
             _ic.send_key(key, hold_sec=_human_hold())
-            # Delay minimo 1.0s + variancia gauss (~1.0-1.6s tipicamente)
-            time.sleep(max(1.0, random.gauss(1.2, 0.2)))
+            time.sleep(random.uniform(0.08, 0.16))
+            # A skill so entra se for CONFIRMADA durante a janela de cast. Como
+            # confirmar depende da skill: umas pedem right-click, outras a
+            # propria tecla repetida.
+            if modo == "teclado":
+                n = _spam_key(_ic, key, janela, abortar=lambda: state.hp_critical)
+                _log(f"[AUX] {key.upper()} janela {janela:.2f}s — {n} teclas")
+            else:
+                n = _spam_right_click(_ic, janela, abortar=lambda: state.hp_critical)
+                _log(f"[AUX] {key.upper()} janela {janela:.2f}s — {n} rclicks")
             if _settings.skill_f1:
                 _ic.send_key('f1', hold_sec=_human_hold())
 
@@ -2503,6 +2852,96 @@ def _aux_loop() -> None:
             break
 
         time.sleep(0.15 if fired else 0.08)
+
+
+_cam_held = False
+
+
+def _cam_release() -> None:
+    """Solta a seta direita. Precisa ser chamada em TODO caminho de saida.
+
+    Se o processo morrer com a tecla pressionada, o Arduino continua reportando
+    ela como pressionada — a serial fecha, mas o HID nao sabe disso, e a tela
+    fica girando sozinha ate o Arduino resetar.
+    """
+    global _cam_held
+    if _cam_held and _ic is not None:
+        try:
+            _ic.key_up('right')
+        except Exception:
+            pass
+    _cam_held = False
+
+
+def _camera_loop() -> None:
+    """Gira a camera pra direita enquanto o bot roda.
+
+    Serve pras skills targetaveis: com a tela varrendo, os mobs entram no campo
+    de mira sem precisar mover o personagem.
+
+    Cede lugar a tudo que importa mais — _can_tick() ja barra durante pot
+    critico, rebuff, repot e quando a janela nao esta em foco. Toque curto na
+    seta, nao tecla presa.
+    """
+    global _cam_held
+    try:
+        while not state.stop:
+            # Segura enquanto o bot roda E a janela do jogo esta em foco. O foco
+            # e obrigatorio: com a tecla presa e o alt-tab dado, a seta iria pro
+            # aplicativo que estiver na frente.
+            #
+            # NAO usa _can_tick(): rebuff e repot nao interrompem o giro, que e
+            # o que "sem parar" quer dizer. Segurar tambem nao disputa serial —
+            # sao dois comandos no total, um ao prender e outro ao soltar.
+            pode = (getattr(_settings, "cam_rotate", False)
+                    and state.active and not state.stop
+                    and _ic is not None
+                    and _target_window_focused())
+            if pode and not _cam_held:
+                try:
+                    _ic.key_down('right')
+                    _cam_held = True
+                    _log("[CAM] giro ligado (seta direita presa)")
+                except Exception:
+                    pass
+            elif not pode and _cam_held:
+                _cam_release()
+                _log("[CAM] giro solto")
+            time.sleep(_CAM_POLL)
+    finally:
+        _cam_release()
+
+
+def _watchdog_loop() -> None:
+    """Desliga o macro se a janela do jogo desaparecer.
+
+    Sem isso o bot fica ativo com o jogo fechado: as threads seguem rodando,
+    a camera continua tentando prender a seta e qualquer volta de foco em
+    outro programa vira input perdido la dentro. Desligar deixa tudo no estado
+    de 'parado' e devolve a HUD.
+
+    Desliga (state.active=False), nao encerra o processo — assim e so reabrir
+    o jogo e dar Ctrl+K de novo.
+    """
+    faltas = 0
+    while not state.stop:
+        time.sleep(_WATCH_PERIOD)
+        if not state.active:
+            faltas = 0
+            continue
+        if _locate_window():
+            faltas = 0
+            continue
+        faltas += 1
+        if faltas < _WATCH_MISSES:
+            continue
+        faltas = 0
+        _log("[SVC] janela do jogo sumiu — desligando o macro")
+        _cam_release()          # nunca deixar a seta presa
+        with state.lock:
+            state.active = False
+        threading.Thread(target=_beep, args=(600, 180),
+                         daemon=True, name=_tname()).start()
 
 
 def _sync_scheduler() -> None:
@@ -2521,14 +2960,15 @@ def _sync_scheduler() -> None:
     state.ready = True
     _log("[SYNC] ready")
 
-    while not state.stop:
-        # Base do settings (5-10 min) + jitter humano.
-        base = _settings.rebuff_minutes * 60.0
-        wait = base * (1.0 + random.uniform(_JITTER_FRAC_LO, _JITTER_FRAC_HI))
-        deadline = time.monotonic() + wait
+    # Cadencia EXATA, sem jitter (pedido do usuario): o rebuff bate sempre no
+    # intervalo configurado. O deadline seguinte e ancorado no ANTERIOR, nao no
+    # fim do ciclo — assim um sync que demorou (por espera de vida, por exemplo)
+    # nao empurra todos os proximos e o intervalo nao acumula atraso.
+    deadline = time.monotonic() + _settings.rebuff_minutes * 60.0
 
+    while not state.stop:
         while time.monotonic() < deadline and not state.stop:
-            time.sleep(0.5)
+            time.sleep(0.1)
 
         if state.stop:
             break
@@ -2539,6 +2979,11 @@ def _sync_scheduler() -> None:
         if state.stop:
             break
 
+        base = _settings.rebuff_minutes * 60.0
+        deadline += base
+        agora = time.monotonic()
+        if deadline <= agora:          # ciclo passou do proprio intervalo
+            deadline = agora + base
         _run_sync()
 
 
@@ -2561,6 +3006,7 @@ user32.DispatchMessageW.argtypes  = [ctypes.POINTER(wt.MSG)]
 
 
 def _force_exit() -> None:
+    _cam_release()
     time.sleep(0.35)
     if _ic:
         try:
@@ -2743,6 +3189,7 @@ def main() -> None:
     @ctypes.WINFUNCTYPE(wt.BOOL, wt.DWORD)
     def _console_ctrl_handler(ctrl_type):
         if ctrl_type in (0, 2, 5, 6):
+            _cam_release()
             _remove_lock()
             if _ic:
                 try:
@@ -2786,6 +3233,8 @@ def main() -> None:
     # threading.Thread(target=_soul_loop,       daemon=True, name=_tname()).start()
     threading.Thread(target=_aux_loop,        daemon=True, name=_tname()).start()
     threading.Thread(target=_buff_monitor,    daemon=True, name=_tname()).start()
+    threading.Thread(target=_camera_loop,     daemon=True, name=_tname()).start()
+    threading.Thread(target=_watchdog_loop,   daemon=True, name=_tname()).start()
 
     _log("[SVC] hotkeys register (RegisterHotKey)")
     if not _register_hotkeys():
@@ -2798,6 +3247,7 @@ def main() -> None:
         pass
     finally:
         state.stop = True
+        _cam_release()
         _remove_lock()
         if _ic:
             try:
