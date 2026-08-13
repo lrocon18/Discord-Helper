@@ -429,6 +429,30 @@ _MOVE_MAX_ITERS   = 30     # iteracoes totais (aproximacao + fino)
 _MOVE_MAX_STALL   = 3      # iteracoes sem deslocamento antes de desistir
 _MOVE_ACCEPT      = 6      # px: erro final ainda aceito (slot e bem maior)
 
+# Deslocamento FIXO, em pixels, do CENTRO da barra de vida ate cada slot de
+# pocao, e da base da barra ate a linha dos slots.
+#
+# Medido nos mapeamentos manuais de 1024x768, 1366x768 e 1918x857: 181/208/233
+# com variacao de 1 a 3px entre resolucoes que diferem em quase 900px de
+# largura. Ou seja, a HUD e desenhada em PIXEL FIXO — os slots nao escalam.
+#
+# Por isso o ratio quebra fora da resolucao mapeada: _PA_R e fracao da largura,
+# entao numa resolucao diferente ele aponta pra outro lugar, a leitura do slot
+# cai no vazio e o pot fica bloqueado achando que nao tem pocao.
+_SLOT_DX = (181, 208, 233)
+_SLOT_DY = 15
+
+
+def _slots_derivados(xs, ws, bottoms) -> tuple | None:
+    """Posicao dos 3 slots a partir da barra de vida ja localizada.
+    None se a barra ainda nao foi encontrada."""
+    if not xs[0] or not ws[0] or not bottoms[0]:
+        return None
+    cx = xs[0] + ws[0] // 2
+    base = bottoms[0]
+    return tuple((cx + dx, base - _SLOT_DY) for dx in _SLOT_DX)
+
+
 # Vigia da janela do jogo. Se o Wartale fechar, o macro se desliga sozinho.
 # A tolerancia existe porque a janela some por instantes legitimos — troca de
 # mapa, mudanca de resolucao, alt-enter. So desliga apos _WATCH_MISSES leituras
@@ -2497,9 +2521,22 @@ def _probe_loop() -> None:
                                                     _war_ws, _war_bottoms)
                         _log(f"[MON] war xs={_war_xs} bottoms={_war_bottoms} "
                              f"(hint={y_hint} max={y_max})")
-                    s1_pos = _to_screen(*_PA_R, w, h, ox, oy)
-                    s2_pos = _to_screen(*_PB_R, w, h, ox, oy)
-                    s3_pos = _to_screen(*_PC_R, w, h, ox, oy)
+                    # Resolucao exatamente mapeada: usa o que o usuario mapeou.
+                    # Qualquer outra: DERIVA da barra, porque o ratio de uma
+                    # resolucao vizinha aponta pro lugar errado numa HUD de
+                    # pixel fixo — era o que travava o pot no notebook.
+                    _derivados = (_slots_derivados(_war_xs, _war_ws, _war_bottoms)
+                                  if (_GAME == "wartale" and (w, h) not in _RES_PROFILES)
+                                  else None)
+                    if _derivados is not None:
+                        s1_pos, s2_pos, s3_pos = _derivados
+                        if _slot_positions != _derivados:
+                            _log(f"[MON] {w}x{h} nao mapeada — slots derivados "
+                                 f"da barra: {_derivados}")
+                    else:
+                        s1_pos = _to_screen(*_PA_R, w, h, ox, oy)
+                        s2_pos = _to_screen(*_PB_R, w, h, ox, oy)
+                        s3_pos = _to_screen(*_PC_R, w, h, ox, oy)
                     _slot_positions = (s1_pos, s2_pos, s3_pos)
                     # Slot empty via template match (5s cache)
                     sx_sc = w / _REF_W; sy_sc = h / _REF_H
