@@ -66,6 +66,7 @@ class HUD:
         buff_labels: dict = None,
         buff_mapped: Callable[[str], bool] = None,
         get_rebuff_eta: Callable[[], float] = None,
+        get_repot_eta: Callable[[], float] = None,
         war_bars_opt: bool = False,
     ):
         self._runtime    = settings
@@ -77,6 +78,7 @@ class HUD:
         self._on_state   = on_state_change
         self._get_active = get_active
         self._get_eta    = get_rebuff_eta
+        self._get_rep    = get_repot_eta
         self._resolutions = resolutions or []
         self._get_res     = get_resolution
         self._capture     = capture_ratio
@@ -136,6 +138,8 @@ class HUD:
         self._badge_state = None
         self._eta_lbl     = None   # regressivo do rebuff, sob o badge
         self._eta_txt     = None   # ultimo texto desenhado (evita reflow por tick)
+        self._rep_lbl     = None   # regressivo do repot, sob o do rebuff
+        self._rep_txt     = None
 
     # ── thread entrypoint ─────────────────────────────────────────────────
     def run(self):
@@ -918,13 +922,17 @@ class HUD:
             # ficaria tremendo de lado. So e empacotado quando ha agenda.
             eta = tk.Label(m, text="", bg=_SUCCESS, fg="white",
                            font=("Consolas", 8))
+            rep = tk.Label(m, text="", bg=_SUCCESS, fg="white",
+                           font=("Consolas", 8))
             self._mini = m
             self._mini_lbl = lbl
             self._eta_lbl = eta
+            self._rep_lbl = rep
         except Exception:
             self._mini = None
             self._mini_lbl = None
             self._eta_lbl = None
+            self._rep_lbl = None
 
     def _place_mini(self):
         """Reancora o badge no canto superior direito. Precisa rodar sempre que a
@@ -952,8 +960,9 @@ class HUD:
         try:
             self._mini.configure(bg=bg)
             self._mini_lbl.configure(text=txt, bg=bg)
-            if self._eta_lbl is not None:
-                self._eta_lbl.configure(bg=bg)
+            for sub in (self._eta_lbl, self._rep_lbl):
+                if sub is not None:
+                    sub.configure(bg=bg)
         except Exception:
             pass
         self._place_mini()
@@ -982,9 +991,48 @@ class HUD:
             if txt:
                 self._eta_lbl.configure(text=txt)
                 if not self._eta_lbl.winfo_ismapped():
-                    self._eta_lbl.pack(padx=12, pady=(0, 5))
+                    # before=: o pack default joga no fim da lista, entao se o
+                    # uptime aparecer primeiro (ele existe antes da agenda de
+                    # rebuff ser armada) o regressivo cairia ABAIXO dele.
+                    if (self._rep_lbl is not None
+                            and self._rep_lbl.winfo_ismapped()):
+                        self._eta_lbl.pack(padx=12, pady=(0, 5),
+                                           before=self._rep_lbl)
+                    else:
+                        self._eta_lbl.pack(padx=12, pady=(0, 5))
             else:
                 self._eta_lbl.pack_forget()
+        except Exception:
+            return
+        self._place_mini()
+
+    def _update_repot(self, active: bool):
+        """Regressivo ate o proximo repot preventivo, sob o do rebuff. Corre em
+        tempo de bot ATIVO, entao congela com o macro parado."""
+        if self._mini is None or self._rep_lbl is None:
+            return
+        txt = ""
+        if active and self._get_rep is not None:
+            try:
+                eta = self._get_rep()
+            except Exception:
+                eta = None
+            if eta is not None:
+                if eta < 0:
+                    txt = "repotando"
+                else:
+                    s = int(eta + 0.5)
+                    txt = f"repot {s // 60}:{s % 60:02d}"
+        if txt == self._rep_txt:
+            return
+        self._rep_txt = txt
+        try:
+            if txt:
+                self._rep_lbl.configure(text=txt)
+                if not self._rep_lbl.winfo_ismapped():
+                    self._rep_lbl.pack(padx=12, pady=(0, 5))
+            else:
+                self._rep_lbl.pack_forget()
         except Exception:
             return
         self._place_mini()
@@ -1025,6 +1073,7 @@ class HUD:
         if self._mini is not None:
             self._update_badge(active)
             self._update_eta(active)
+            self._update_repot(active)
         # Status + poll de resolucao so enquanto a config existe (antes de ligar).
         if self.win is not None:
             self._update_status(active)

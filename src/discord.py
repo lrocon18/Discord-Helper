@@ -210,6 +210,20 @@ def _is_active() -> bool:
     return state.active
 
 
+def _repot_eta() -> float | None:
+    """Segundos (de bot ativo) ate o proximo repot preventivo, pra HUD.
+
+    None  = nao se aplica a este jogo
+    -1.0  = repot acontecendo agora
+    >= 0  = quanto falta
+    """
+    if _GAME != "wartale":
+        return None
+    if state.repotting:
+        return -1.0
+    return max(0.0, state.next_repot_at - state.run_secs)
+
+
 def _rebuff_eta() -> float | None:
     """Segundos ate o proximo rebuff, pra HUD.
 
@@ -349,6 +363,8 @@ _SYNC_HP_MIN  = 55
 
 _SYNC_SPAM_HZ_LO = 5.0
 _SYNC_SPAM_HZ_HI = 8.0
+# Wartale: tecla mantida pressionada do inicio ao fim do rebuff.
+_SYNC_HOLD_KEY = 'a'
 
 _REF_W = 1920   # reference resolution for template scaling
 _REF_H = 1009
@@ -437,6 +453,15 @@ _REPOT_CD         = 20.0   # cooldown base entre tentativas do mesmo slot
 _REPOT_BACKOFF    = 2.0    # multiplicador por tentativa que nao resolveu
 _REPOT_CD_MAX     = 300.0  # teto do backoff (mochila sem pocao -> para de tentar)
 _REPOT_JIT_PX     = 3      # jitter de coordenada no ponto da pocao
+# Repot preventivo: a cada N segundos de bot ATIVO reabastece os tres slots sem
+# perguntar se estao vazios. Existe porque a deteccao de slot vazio nao e
+# confiavel o bastante pra segurar sozinha — 60 disparos numa sessao e nenhum
+# slot reabastecido.
+_REPOT_ALL_EVERY  = 1800.0 # 30 min de bot ativo
+# Pausa ENTRE as pocoes na passada preventiva. O repot por slot vazio corre o
+# mais rapido possivel (o slot ja esta vazio); a passada periodica nao tem
+# pressa, entao respira 1s entre uma pocao e a proxima.
+_REPOT_ALL_GAP    = 1.0
 _REPOT_MOVE_TOL   = 2      # px: alvo considerado atingido
 
 # Posicionamento do cursor (_move_cursor_to). O Windows amplifica o delta de
@@ -785,11 +810,17 @@ class State:
     # caindo era o que matava o personagem.
     hp_low: bool = False
     hp_pct: int = -1          # ultima leitura (-1 = desconhecida)
-    hp_slot_empty: bool = False
     last_hp_pot: float = 0.0
     # Deadline (monotonic) do proximo rebuff. 0.0 = agenda ainda nao armada.
     # Publicado pelo _sync_scheduler pra HUD desenhar o regressivo.
     next_sync_at: float = 0.0
+    # Segundos de bot ATIVO acumulados. Tempo parado (Ctrl+K desligado) nao
+    # conta. Acumulado pelo _probe_loop, que so roda com o macro ligado.
+    run_secs: float = 0.0
+    # Quando o proximo repot preventivo vence, medido em run_secs e nao em
+    # monotonic: a agenda corre em tempo de bot ATIVO, entao o regressivo da
+    # HUD congela junto com o macro em vez de vencer com ele desligado.
+    next_repot_at: float = _REPOT_ALL_EVERY
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def paused_by_user(self) -> bool:
@@ -1026,28 +1057,6 @@ def _human_click(ic, double: bool = False, right: bool = False) -> None:
         return
     _sleep_human(0.018, 0.060)
     ic.send_mouse_click(double=double, right=right)
-
-
-def _pot_hp_rebuff() -> None:
-    """Bebe uma pocao de vida entre as skills do rebuff.
-
-    A janela do rebuff e o momento mais exposto do ciclo: o personagem para de
-    atacar e fica parado castando. Uma pocao por skill mantem a vida no teto
-    durante essa janela, em vez de depender de reagir a uma queda que pode ser
-    mais rapida que o loop.
-
-    NAO mexe em state.last_hp_pot de proposito: aquele campo segura o rebuff
-    por 1.5s e e pra emergencia. Marcar aqui faria o ciclo pausar depois de
-    cada skill sem necessidade.
-    """
-    if _ic is None or state.stop:
-        return
-    if state.hp_slot_empty:
-        _log("[SYNC] pot entre skills pulada — slot de vida vazio")
-        return
-    time.sleep(random.uniform(0.05, 0.12))
-    _ic.send_key('1', hold_sec=random.uniform(0.02, 0.04))
-    _log(f"[SYNC] pot de vida entre skills (hp={state.hp_pct}%)")
 
 
 def _spam_key(ic, key: str, duration: float, abortar=None) -> int:
@@ -2233,24 +2242,25 @@ def _run_sync() -> None:
 
     state.syncing = True
     _log("[SYNC] start")
-    # Cursor vai pro meio da HUD durante TODO o ciclo: o right-click que
-    # confirma cada skill nao pode cair sobre monstro, senao vira ataque.
+    # Cursor vai pro meio da HUD durante TODO o ciclo. No PT EU e obrigatorio
+    # (o right-click que confirma a skill viraria ataque sobre um monstro); no
+    # Wartale, que agora confirma so por teclado, e o cursor fora do caminho.
     _mouse_orig = _park_mouse()
-    # Wartale: cada skill do rebuff so entra com o right-click martelando a
-    # janela de cast inteira. PT EU segue no double-click unico + espera.
+    # Wartale: cada skill do rebuff entra com a PROPRIA tecla martelada durante
+    # a janela de cast inteira — nao ha mais right-click aqui. PT EU segue no
+    # double-click unico + espera.
     _war = _GAME == "wartale"
     _passo_atual = ['']      # qual key esta na janela de cast agora
 
     def _cast_window(secs: float) -> None:
-        """Consome `secs` segundos confirmando o cast: spam no Wartale,
-        double-click + espera no PT EU. Aborta na hora se a vida cair — o spam
-        segura a serial, e segurar a serial atrasa a pot."""
-        if _war and _f1_teclado() and _passo_atual[0] == 'f1':
-            n = _spam_key(_ic, 'f1', secs, abortar=_hp_emergencia)
-            _log(f"[SYNC] cast window {secs:.2f}s — {n} teclas f1")
-        elif _war:
-            n = _spam_right_click(_ic, secs, abortar=_hp_emergencia)
-            _log(f"[SYNC] cast window {secs:.2f}s — {n} rclicks")
+        """Consome `secs` segundos confirmando o cast: no Wartale martelando a
+        tecla do proprio passo, no PT EU double-click + espera. Aborta na hora
+        se a vida cair — o spam segura a serial, e segurar a serial atrasa a
+        pot."""
+        if _war:
+            tecla = _passo_atual[0]
+            n = _spam_key(_ic, tecla, secs, abortar=_hp_emergencia)
+            _log(f"[SYNC] cast window {secs:.2f}s — {n} teclas {tecla}")
         else:
             _human_click(_ic, double=True, right=True)
             fim = time.monotonic() + secs
@@ -2260,6 +2270,13 @@ def _run_sync() -> None:
                 time.sleep(0.02)
 
     try:
+        # Wartale: 'A' fica pressionado do inicio ao fim do ciclo. Dentro do
+        # try pra que o finally solte a tecla haja o que houver — inclusive se
+        # o ciclo abortar por vida no primeiro passo.
+        if _war:
+            _reb_hold()
+            _log(f"[SYNC] tecla {_SYNC_HOLD_KEY.upper()} segurada durante o rebuff")
+
         # O rebuff e uma SEQUENCIA RETOMAVEL. Antes era um bloco corrido de ~8s
         # em que o personagem parava de atacar e so castava — com a vida caindo,
         # ele morria no meio. Agora, antes de cada passo, o ciclo espera a vida
@@ -2285,11 +2302,12 @@ def _run_sync() -> None:
             _ic.send_key(key, hold_sec=random.uniform(0.08, 0.15))
             time.sleep(random.uniform(0.08, 0.15))
             _cast_window(janela())
-            # Uma pocao de vida por skill rebuffada.
-            _pot_hp_rebuff()
             i += 1
 
     finally:
+        # Solta o 'A' antes de qualquer outra coisa: se o ciclo abortou no meio
+        # (vida nao estabilizou, stop), a tecla nao pode ficar presa.
+        _reb_release()
         # Devolve o cursor mesmo se o ciclo abortou no meio.
         _unpark_mouse(_mouse_orig)
         state.syncing = False
@@ -2380,16 +2398,28 @@ def _buff_monitor() -> None:
                 # ja consulta, entao levantar aqui para idle_tick e aux_loop.
                 state.syncing = True
                 orig = _park_mouse()
+                # Recast avulso e um cast de buff igual aos do _run_sync, entao
+                # segue a mesma regra no Wartale: 'A' preso e confirmacao pela
+                # propria tecla, sem right-click.
+                _war_b = _GAME == "wartale"
+                if _war_b:
+                    _reb_hold()
                 try:
                     _ic.send_key(key, hold_sec=_human_hold())
                     time.sleep(random.uniform(0.12, 0.22))
-                    _human_click(_ic, double=False, right=True)
                     last_recast[b] = time.monotonic()
                     faltas[b] = 0
-                    time.sleep(max(_BUFF_CAST_WAIT,
-                                   random.gauss(_BUFF_CAST_WAIT, 0.2)))
+                    espera = max(_BUFF_CAST_WAIT,
+                                 random.gauss(_BUFF_CAST_WAIT, 0.2))
+                    if _war_b:
+                        _spam_key(_ic, key, espera)
+                    else:
+                        _human_click(_ic, double=False, right=True)
+                        time.sleep(espera)
                     _buff_back_to_main()
                 finally:
+                    if _war_b:
+                        _reb_release()
                     _unpark_mouse(orig)
                     state.syncing = False
         except Exception as e:
@@ -2439,7 +2469,7 @@ def _repot_ratio(slot_idx: int) -> tuple | None:
     return (_RA_R, _RB_R, _RC_R)[slot_idx]
 
 
-def _repot_slot(slot_idx: int) -> bool:
+def _repot_slot(slot_idx: int, slot_pos: tuple | None = None) -> bool:
     """Reabastece um slot de pot vazio pela mochila (Wartale).
 
     Sequencia: guarda a posicao do cursor -> V (abre inventario) -> espera 2s ->
@@ -2474,6 +2504,12 @@ def _repot_slot(slot_idx: int) -> bool:
     state.repotting = True
     inv_open = False
     try:
+        # Solta a seta da camera AQUI, sincrono, antes do V. Deixar isso pro
+        # _camera_loop nao serve: ele so reavalia a cada _CAM_POLL (80ms) e o V
+        # sairia com a tecla ainda presa. Ele nao reprende enquanto
+        # state.repotting estiver de pe, e volta a segurar sozinho no fim.
+        _cam_release()
+        time.sleep(0.06)          # key-up chegar ao jogo antes do V
         _log(f"[INV] {label} slot empty — refill via bag at ({tx},{ty})")
         _ic.send_key('v', hold_sec=_human_hold())
         inv_open = True
@@ -2485,6 +2521,9 @@ def _repot_slot(slot_idx: int) -> bool:
             return False
 
         _sleep_human(0.12, 0.28)
+        # Onde o cursor REALMENTE parou. _move_cursor_to devolve True dentro de
+        # _REPOT_MOVE_TOL, mas so o valor medido diz se ele ficou sobre o item.
+        _log(f"[INV] {label} cursor em {_cursor_pos()} (alvo {tx},{ty})")
         # SHIFT segurado, tecla do slot batida, SHIFT solto (finally no wrapper).
         _ic.send_combo('shift', key, hold_sec=_human_hold(0.04, 0.09),
                        pre_sec=random.uniform(0.05, 0.11),
@@ -2506,7 +2545,100 @@ def _repot_slot(slot_idx: int) -> bool:
                 _ic.send_key('v', hold_sec=_human_hold())
             except Exception:
                 pass
+        # O slot mudou depois do repot? Sem esta leitura o log so diz "SHIFT
+        # enviado" e da a tentativa por boa — foi exatamente isso que mascarou
+        # 60 falhas seguidas: a serial aceitou tudo e nada chegou ao jogo.
+        if slot_pos is not None:
+            try:
+                time.sleep(0.35)
+                hdc_v = user32.GetDC(None)
+                try:
+                    depois = _read_px(hdc_v, *slot_pos)
+                finally:
+                    user32.ReleaseDC(None, hdc_v)
+                _log(f"[INV] {label} slot pos-repot: px={depois} "
+                     f"escuro={_no_signal(depois)}")
+            except Exception:
+                pass
         state.repotting = False
+
+
+def _repot_todos() -> int:
+    """Reabastece os TRES slots de uma vez. Retorna quantos foram tentados.
+
+    Abre a mochila UMA vez, passa pelas tres pocoes e fecha — chamar
+    _repot_slot tres vezes abriria e fecharia o inventario tres vezes, ~12s de
+    personagem parado em vez de ~5s.
+
+    NAO olha se o slot esta vazio: e preventivo de proposito. A deteccao de
+    slot vazio dispara certo mas o reabastecimento nao chega ao jogo (60
+    tentativas numa sessao, zero slots repostos), entao a passada periodica
+    nao pode depender dela.
+    """
+    if _GAME != "wartale" or _ic is None:
+        return 0
+    alvos = [(i, _repot_ratio(i)) for i in range(3)]
+    alvos = [(i, r) for i, r in alvos if r is not None]
+    if not alvos:
+        return 0
+    hwnd = _locate_window()
+    dims = _query_viewport(hwnd) if hwnd else None
+    if dims is None or not _target_window_focused():
+        return 0
+
+    w, h, ox, oy = dims
+    origin = _cursor_pos()
+    feitos = 0
+
+    state.repotting = True
+    inv_open = False
+    try:
+        # Mesma razao do _repot_slot: solta a seta da camera antes do V, aqui,
+        # sincrono — o _camera_loop so reavaliaria 80ms depois.
+        _cam_release()
+        time.sleep(0.06)
+        _log(f"[INV] repot preventivo ({len(alvos)} slots) — abrindo mochila")
+        _ic.send_key('v', hold_sec=_human_hold())
+        inv_open = True
+        time.sleep(_REPOT_OPEN_WAIT + max(0.0, random.gauss(0.25, 0.10)))
+
+        for n, (i, ratio) in enumerate(alvos):
+            if state.stop:
+                break
+            if n:
+                # Respiro entre uma pocao e a proxima. Gaussiano em volta de
+                # _REPOT_ALL_GAP e nao fixo — tres pausas identicas seguidas,
+                # a cada 30 min, sao um padrao bom demais pra ignorar.
+                time.sleep(max(0.6, random.gauss(_REPOT_ALL_GAP, 0.15)))
+            label = _REPOT_LABELS[i]
+            tx, ty = _to_screen(ratio[0], ratio[1], w, h, ox, oy)
+            tx += random.randint(-_REPOT_JIT_PX, _REPOT_JIT_PX)
+            ty += random.randint(-_REPOT_JIT_PX, _REPOT_JIT_PX)
+            if not _move_cursor_to(_ic, tx, ty):
+                _log(f"[INV] {label} cursor nao chegou — pulando")
+                continue
+            _sleep_human(0.12, 0.28)
+            _ic.send_combo('shift', str(i + 1),
+                           hold_sec=_human_hold(0.04, 0.09),
+                           pre_sec=random.uniform(0.05, 0.11),
+                           post_sec=random.uniform(0.06, 0.13))
+            _sleep_human(0.18, 0.35)
+            _log(f"[INV] {label} SHIFT+{i + 1} preventivo | "
+                 f"cursor={_cursor_pos()} alvo=({tx},{ty})")
+            feitos += 1
+    except Exception as e:
+        _log(f"[ERR] repot preventivo: {type(e).__name__}: {e}")
+    finally:
+        if origin is not None:
+            _move_cursor_to(_ic, origin[0], origin[1])
+        if inv_open:
+            try:
+                _sleep_human(0.10, 0.22)
+                _ic.send_key('v', hold_sec=_human_hold())
+            except Exception:
+                pass
+        state.repotting = False
+    return feitos
 
 
 def _probe_loop() -> None:
@@ -2516,6 +2648,7 @@ def _probe_loop() -> None:
         empty_since       = [0.0, 0.0, 0.0]  # monotonic em que o slot ficou vazio
         last_repot        = [0.0, 0.0, 0.0]
         repot_tries       = [0, 0, 0]     # tentativas seguidas sem resolver
+        _run_last         = 0.0           # tick anterior; 0 = macro estava parado
         _hwnd             = None
         _dims             = None
         _bar_xs           = None
@@ -2536,10 +2669,17 @@ def _probe_loop() -> None:
 
         while not state.stop:
             if not _can_probe():
+                _run_last = 0.0      # parado nao conta tempo de execucao
                 time.sleep(0.1)
                 continue
 
             now_m = time.monotonic()
+            # Uptime: este loop so roda com o macro ligado, entao somar o delta
+            # entre ticks aqui ja da "tempo de bot ativo" sem precisar
+            # instrumentar cada ponto que liga/desliga o macro.
+            if _run_last:
+                state.run_secs += now_m - _run_last
+            _run_last = now_m
             if now_m >= _next_refresh or _dims is None:
                 _hwnd         = _locate_window()
                 _dims         = _query_viewport(_hwnd) if _hwnd else None
@@ -2825,6 +2965,25 @@ def _probe_loop() -> None:
             # loop infinito quando a mochila tambem esta sem pocao.
             did_repot = False
             if _GAME == "wartale":
+                # Passada preventiva a cada _REPOT_ALL_EVERY de bot ativo,
+                # independente do que os slots estejam lendo. Se cair durante o
+                # rebuff, espera o proximo tick — next_repot_at so avanca
+                # quando a passada realmente roda, entao ela nao e perdida.
+                if (state.run_secs >= state.next_repot_at
+                        and not state.syncing and _can_probe()):
+                    if _repot_todos():
+                        _log(f"[INV] repot preventivo feito aos "
+                             f"{state.run_secs / 60.0:.0f} min de bot ativo")
+                        state.next_repot_at = state.run_secs + _REPOT_ALL_EVERY
+                        # ~8s se passaram: barras e slots lidos acima sao
+                        # passado, e cair no repot por slot vazio abriria a
+                        # mochila de novo no mesmo tick. Re-le tudo.
+                        _next_refresh = 0.0
+                        continue
+                    # Nao rolou (janela sem foco, pocoes nao mapeadas). Nao
+                    # queima a janela dos 30 min por causa de um alt-tab —
+                    # tenta de novo logo, sem logar pra nao encher o arquivo.
+                    state.next_repot_at = state.run_secs + 30.0
                 now_r = time.monotonic()
                 for _i in range(3):
                     if not _empty(_slot_empty_tmpl[_i], (s1_c, s2_c, s3_c)[_i]):
@@ -2835,8 +2994,13 @@ def _probe_loop() -> None:
                         continue
                     if empty_since[_i] == 0.0:
                         empty_since[_i] = now_r
+                    # state.syncing: o rebuff segura o 'A' e martela F-keys. Um
+                    # SHIFT+N no meio disso vira combinacao com as duas e mexe
+                    # item na mochila. Adiar ~8s nao custa nada — o slot vazio
+                    # continua vazio e o proximo tick tenta de novo.
                     if (now_r - empty_since[_i] < _REPOT_CONFIRM
                             or _repot_ratio(_i) is None
+                            or state.syncing
                             or not _can_probe()):
                         continue
                     cd = min(_REPOT_CD_MAX,
@@ -2846,7 +3010,8 @@ def _probe_loop() -> None:
                     _log(f"[INV] slot {_i} vazio confirmado: "
                          f"tmpl={_slot_empty_tmpl[_i]} "
                          f"px={(s1_c, s2_c, s3_c)[_i]}")
-                    fired_repot = _repot_slot(_i)
+                    fired_repot = _repot_slot(
+                        _i, slot_pos=(s1_pos, s2_pos, s3_pos)[_i])
                     last_repot[_i]  = time.monotonic()
                     empty_since[_i] = 0.0
                     if fired_repot:
@@ -2873,7 +3038,6 @@ def _probe_loop() -> None:
             hp_low = _low(hp_pct, _settings.pot_hp_pct)
             state.hp_low = hp_low
             state.hp_pct = hp_pct
-            state.hp_slot_empty = _empty(_slot_empty_tmpl[0], s1_c)
             state.hp_critical = hp_low and hp_pct <= max(1, _settings.pot_hp_pct // 2)
 
             if hp_low:
@@ -3035,6 +3199,35 @@ def _cam_release() -> None:
     _cam_held = False
 
 
+_reb_held = False
+
+
+def _reb_release() -> None:
+    """Solta o 'A' segurado durante o rebuff. Mesmo contrato do _cam_release:
+    tem que ser chamada em TODO caminho de saida, porque uma tecla presa no HID
+    sobrevive ao fim do processo — a serial fecha e o Arduino continua
+    reportando a tecla ate resetar."""
+    global _reb_held
+    if _reb_held and _ic is not None:
+        try:
+            _ic.key_up(_SYNC_HOLD_KEY)
+        except Exception:
+            pass
+    _reb_held = False
+
+
+def _reb_hold() -> None:
+    """Segura o 'A' pelo tempo do rebuff (Wartale)."""
+    global _reb_held
+    if _ic is None or _reb_held:
+        return
+    try:
+        _ic.key_down(_SYNC_HOLD_KEY)
+        _reb_held = True
+    except Exception:
+        _reb_held = False
+
+
 def _camera_loop() -> None:
     """Gira a camera pra direita enquanto o bot roda.
 
@@ -3052,11 +3245,18 @@ def _camera_loop() -> None:
             # e obrigatorio: com a tecla presa e o alt-tab dado, a seta iria pro
             # aplicativo que estiver na frente.
             #
-            # NAO usa _can_tick(): rebuff e repot nao interrompem o giro, que e
-            # o que "sem parar" quer dizer. Segurar tambem nao disputa serial —
-            # sao dois comandos no total, um ao prender e outro ao soltar.
+            # NAO usa _can_tick(): o rebuff nao interrompe o giro, que e o que
+            # "sem parar" quer dizer. Segurar tambem nao disputa serial — sao
+            # dois comandos no total, um ao prender e outro ao soltar.
+            #
+            # O REPOT e a unica excecao, e por evidencia: com a seta presa a
+            # sessao inteira, 60 SHIFT+<slot> sairam e nenhum slot foi
+            # reabastecido. Nas sessoes em que a seta ia e voltava, o repot
+            # funcionou. O jogo nao aceita a combinacao com uma tecla de
+            # movimento pressionada. Sao ~4s de giro perdidos por repot.
             pode = (getattr(_settings, "cam_rotate", False)
                     and state.active and not state.stop
+                    and not state.repotting
                     and _ic is not None
                     and _target_window_focused())
             if pode and not _cam_held:
@@ -3100,6 +3300,7 @@ def _watchdog_loop() -> None:
         faltas = 0
         _log("[SVC] janela do jogo sumiu — desligando o macro")
         _cam_release()          # nunca deixar a seta presa
+        _reb_release()          # nem o 'A' do rebuff
         with state.lock:
             state.active = False
         threading.Thread(target=_beep, args=(600, 180),
@@ -3171,6 +3372,7 @@ user32.DispatchMessageW.argtypes  = [ctypes.POINTER(wt.MSG)]
 
 def _force_exit() -> None:
     _cam_release()
+    _reb_release()
     time.sleep(0.35)
     if _ic:
         try:
@@ -3354,6 +3556,7 @@ def main() -> None:
     def _console_ctrl_handler(ctrl_type):
         if ctrl_type in (0, 2, 5, 6):
             _cam_release()
+            _reb_release()
             _remove_lock()
             if _ic:
                 try:
@@ -3376,6 +3579,7 @@ def main() -> None:
         on_state_change=_save_hud_state,
         get_active=_is_active,
         get_rebuff_eta=_rebuff_eta,
+        get_repot_eta=_repot_eta,
         resolutions=resolution_keys(),
         get_resolution=_current_resolution,
         capture_ratio=_capture_ratio,
@@ -3414,6 +3618,7 @@ def main() -> None:
     finally:
         state.stop = True
         _cam_release()
+        _reb_release()
         _remove_lock()
         if _ic:
             try:
